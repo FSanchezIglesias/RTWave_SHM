@@ -49,7 +49,7 @@ Initial ray beam definition of 40 rays (20 symmetric and 20 antisymmetric)
 ```python
 nrays = 20
 ibeam = Beam(nrays, [[0,200],],
-             medium=m1, color=np.array((0.2, 0.6, 0.2, 1.)),
+             medium=m1,
              f=300.e+3, npeaks=3, nfft=500, t=t)
 ```
 
