@@ -2,10 +2,11 @@ from utils_rays.geom_utils import dot_2d, norm_2d
 from RayTracing.Ray import Ray
 import math
 import numpy as np
+import logging
 
 
 def ray_refl(ray, n, d, intersect, t_int, t,
-             ratio, h5file, bl=0., ratio_mode=1.):
+             ratio, map, bl=0., ratio_mode=1.):
     """ Reflects ray
 
     :param ray: incident ray
@@ -41,17 +42,17 @@ def ray_refl(ray, n, d, intersect, t_int, t,
     # Mode change of reflection:
     ray_mc = mode_change(ray, a_i * ratio * (1 - ratio_mode) * (1 - bl))
     irays.append(ray_mc.__hash__())
-    irays.extend(ray_mc.trace(t, h5file))
+    irays.extend(ray_mc.trace(t, map))
 
     # Propagate original ray to t, once the direction and everything else is modified
-    irays.extend(ray.trace(t, h5file))
+    irays.extend(ray.trace(t, map))
 
     # end function and return refraction or new modes if any
     return irays, ray_params_i
 
 
 def ray_refr(ray, n, d, intersect, t_int, t, rd, ra, rf,
-             ratio, m2, h5file, bl=0., ratio_mode=1.):
+             ratio, m2, map, bl=0., ratio_mode=1.):
     """ Refracts ray
      Make sure to execute this always before the reflection!!!
 
@@ -100,9 +101,9 @@ def ray_refr(ray, n, d, intersect, t_int, t, rd, ra, rf,
         # Propagate rays to t
         # this is a trace method so new rays could be generated here and must be captured
         irays.append(ray_refr.__hash__())
-        irays.extend(ray_refr.trace(t, h5file))
+        irays.extend(ray_refr.trace(t, map))
         irays.append(ray_refr_mc.__hash__())
-        irays.extend(ray_refr_mc.trace(t, h5file))
+        irays.extend(ray_refr_mc.trace(t, map))
 
     # end function and return refraction or new modes if any
     return irays
@@ -240,4 +241,82 @@ def split_ray(ray, t_ind,
     z_ray[zi_ray > 0] = z_ray[zi_ray > 0] / zi_ray[zi_ray > 0]
 
     return z_ray
+
+
+def save_ray(ray, h5file, ray_group='rays'):
+    """  Stores ray on hdf5 file.
+
+    :param ray: Ray object
+    :param h5file: hdf5 file. Must be opened
+    :param ray_group: hdf5 group, default: 'rays'
+    :return: None
+    """
+
+    # Matrix stuff
+    a = ray.a
+    x = ray.x
+    int_t = ray.int_times
+    tr_points = ray.trace_points  # vector nx2
+    d = ray.d  # vector nx2
+    freq = ray.freq  # vector nxm
+
+    mat = np.column_stack([a, x, int_t])
+    try:
+        mat = np.concatenate([mat, tr_points, d, freq], axis=1)
+    except:
+        logging.error('Unable to save Ray: {: #X}'.format(ray.__hash__()))
+        return None
+
+    try:
+        dset = h5file.create_dataset(ray_group + '/' + str(ray.__hash__()), data=mat, maxshape=(None, mat.shape[1]))
+        # Attributes
+        # dset.attrs['t'] = ray.t
+        dset.attrs['medium'] = ray.medium.__hash__()  # to float beacuse precision length.... it shouldnt be a problem here?
+        dset.attrs['kind'] = ray.kind
+        dset.attrs['parent'] = ray.parent  # .__hash__()
+        # dset.attrs['fftf'] = ray.fft_freq
+        dset.attrs['alive'] = ray.alive
+
+    except ValueError:
+        # Grows the dataset
+        # TODO: REVIEW ALL THIS SHIT
+        dset = h5file[ray_group + '/' + str(ray.__hash__())]
+        dset.resize(mat.shape[0], axis=0)
+        dset[:] = mat
+
+
+def load_ray(rhash, h5file, rmap, ray_group='rays'):
+    """ Loads a ray from an hdf5 file
+
+    :param rhash: Ray identifies hash value
+    :param h5file: hdf5 file, must be opened
+    :param rmap: ray map
+    :param ray_group: hdf5 group, default: 'rays'
+    :return: ray object
+    """
+
+    dset = h5file.get(ray_group + '/' + str(rhash))
+    if dset is not None:
+        a, it, tr, d, freq = np.real(dset[:, 0]), np.real(dset[:, 2]), np.real(dset[:, 3:5]),\
+            np.real(dset[:, 5:7]), dset[:, 7:]
+
+        ray = Ray(origin=tr[0, :], direction=d[0, :], freq=freq[0, :], medium=rmap.mediums[dset.attrs['medium']],
+                  t=rmap.init_beam.t,
+                  kind=dset.attrs['kind'], t0=it[0], a=a[0], parent=dset.attrs['parent'])
+
+        ray.alive = dset.attrs['alive']
+        ray.a = a
+        ray.x = np.real(dset[:, 1])
+        ray.int_times = it
+        ray.trace_points = tr
+        ray.d = d
+        ray.freq = freq
+    else:
+        # logging.error('Error loading ray: {: #X}'.format(rhash))
+        ray = Ray(np.array([0., 0.]), direction=np.array([1., 0.]), freq=[0.], medium=None,
+                  t=rmap.init_beam.t,
+                  kind='', t0=0., a=0., parent=0)
+        ray.alive = False
+
+    return ray
 

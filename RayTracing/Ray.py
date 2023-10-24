@@ -1,6 +1,7 @@
 import numpy as np
 from scipy.fft import rfft, rfftfreq, irfft
 from utils_rays.geom_utils import norm_2d
+# from utils_rays.ray_utils import save_ray
 from RayTracing.Signal import burst_hann
 import logging
 
@@ -10,85 +11,6 @@ ray_color = np.array((0.2, 0.6, 0.2, 0.7))  # default ray color
 
 def alive_ray(ray, i=-1):
     return (ray.a[i] > a_tol) and ray.alive
-
-
-def save_ray(ray, h5file, ray_group='rays'):
-    """  Stores ray on hdf5 file.
-
-    :param ray: Ray object
-    :param h5file: hdf5 file. Must be opened
-    :param ray_group: hdf5 group, default: 'rays'
-    :return: None
-    """
-
-    # Matrix stuff
-    a = ray.a
-    x = ray.x
-    int_t = ray.int_times
-    tr_points = ray.trace_points  # vector nx2
-    d = ray.d  # vector nx2
-    freq = ray.freq  # vector nxm
-
-    mat = np.column_stack([a, x, int_t])
-    try:
-        mat = np.concatenate([mat, tr_points, d, freq], axis=1)
-    except:
-        logging.error('Unable to save Ray: {: #X}'.format(ray.__hash__()))
-        return None
-
-    try:
-        dset = h5file.create_dataset(ray_group + '/' + str(ray.__hash__()), data=mat, maxshape=(None, mat.shape[1]))
-        # Attributes
-        # dset.attrs['t'] = ray.t
-        dset.attrs['medium'] = ray.medium.__hash__()  # to float beacuse precision length.... it shouldnt be a problem here?
-        dset.attrs['kind'] = ray.kind
-        dset.attrs['parent'] = ray.parent  # .__hash__()
-        # dset.attrs['fftf'] = ray.fft_freq
-        dset.attrs['alive'] = ray.alive
-
-    except ValueError:
-        # Grows the dataset
-        # TODO: REVIEW ALL THIS SHIT
-        dset = h5file[ray_group + '/' + str(ray.__hash__())]
-        dset.resize(mat.shape[0], axis=0)
-        dset[:] = mat
-
-
-def load_ray(rhash, h5file, rmap, ray_group='rays'):
-    """ Loads a ray from an hdf5 file
-
-    :param rhash: Ray identifies hash value
-    :param h5file: hdf5 file, must be opened
-    :param rmap: ray map
-    :param ray_group: hdf5 group, default: 'rays'
-    :return: ray object
-    """
-
-    dset = h5file.get(ray_group + '/' + str(rhash))
-    if dset is not None:
-        a, it, tr, d, freq = np.real(dset[:, 0]), np.real(dset[:, 2]), np.real(dset[:, 3:5]),\
-            np.real(dset[:, 5:7]), dset[:, 7:]
-
-        ray = Ray(origin=tr[0, :], direction=d[0, :], freq=freq[0, :], medium=rmap.mediums[dset.attrs['medium']],
-                  t=rmap.init_beam.t,
-                  kind=dset.attrs['kind'], t0=it[0], a=a[0], parent=dset.attrs['parent'])
-
-        ray.alive = dset.attrs['alive']
-        ray.a = a
-        ray.x = np.real(dset[:, 1])
-        ray.int_times = it
-        ray.trace_points = tr
-        ray.d = d
-        ray.freq = freq
-    else:
-        # logging.error('Error loading ray: {: #X}'.format(rhash))
-        ray = Ray(np.array([0., 0.]), direction=np.array([1., 0.]), freq=[0.], medium=None,
-                  t=rmap.init_beam.t,
-                  kind='', t0=0., a=0., parent=0)
-        ray.alive = False
-
-    return ray
-
 
 class Ray:
     __slots__ = ('parent', 't',
@@ -195,17 +117,15 @@ class Ray:
         # Implement direction change?
         d_i = d
 
-        # FFT time shifting
-        f_i = np.exp((0.-1j) * 2 * np.pi * self.fft_freq * (t-t0)) * f0
-        # Implement dispersion
-        f_i = self.medium.dispersion(f_i, t-t0)
+        # Dispersion and time shift
+        f_i = self.medium.fshift(f0, x_i, self, i)
 
         # Transmission loss
         a_i = self.medium.tl(self, i, t - t0)
 
         return self.x[i] + x_i, trace_i, d_i, f_i, a_i, t
 
-    def trace(self, t, h5file):
+    def trace(self, t, map):
         """
 
         :param t: time to advance ray (sorry)
@@ -226,12 +146,12 @@ class Ray:
         rfr_rays = []
 
         for obj in self.medium.objs:
-            rfr_rays.extend(obj.intersect(self, t, h5file))
+            rfr_rays.extend(obj.intersect(self, t, map))
 
-        save_ray(self, h5file)  # saves ray
+        map.save_ray(self)  # saves ray
         return rfr_rays
 
-    def retrace(self, length, h5file):
+    def retrace(self, length, map):
         """ Calculates additional n points inbetween traces
 
         # :param n: number of points
@@ -276,7 +196,7 @@ class Ray:
         self.freq = freq
         self.a = a
 
-        save_ray(self, h5file)  # saves ray
+        map.save_ray(self)  # saves ray
 
     def set_param(self, x, trace, d, f, a, t, i=None):
         """ Sets the ray parameters after each iteration
@@ -355,10 +275,11 @@ class Ray:
 
         a_i, f_i, t_i = self.signal_at_x_f(x)
         s = a_i*irfft(f_i, n=len(self.t))
-        # everything befor the time in wich the ray reaches x must be 0
+        # everything before the time in which the ray reaches x must be 0
         # solves weird fft issues
         # tz = np.ones(self.t.shape)
-        s[self.t < t_i] = 0
+        # t/2 to account for dispersion and still get rid of weird stuff safely
+        s[self.t < t_i/2] = 0
         # s *= tz
 
         return s
@@ -469,7 +390,7 @@ class Beam:
                 fd = f / npeaks
 
             # default is 5 periods with 100 points per period
-            self.t = kwargs.get('t', np.arange(0, 1/f*npeaks*5, 1/(100*f)))
+            self.t = kwargs.get('t', np.arange(0, 1/fd*5, 1/(100*f)))
             self.nfft = kwargs.get('nfft', 50)
             s = signal_f(self.t, self.a0, f, fd)
 

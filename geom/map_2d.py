@@ -2,8 +2,7 @@
 import logging
 from tqdm import tqdm
 import h5py
-from RayTracing.Ray import load_ray
-from utils_rays.ray_utils import split_ray
+from utils_rays.ray_utils import split_ray, load_ray, save_ray
 import gc
 
 
@@ -47,7 +46,7 @@ class Map2D:
         if (procs is None) or (procs == 1):
             for i in tqdm(range(len(self.init_beam.rays))):
                 ray = self.init_beam.rays[i]
-                rays_r = ray.trace(t, self.h5file)  # returns hashes
+                rays_r = ray.trace(t, self)  # returns hashes
                 self.rays_h += rays_r
                 gc.collect()
 
@@ -71,8 +70,8 @@ class Map2D:
         """ Executes the retrace method on all rays stored in the map
         """
         for rh in self.rays_h:
-            ray = load_ray(rh, self.h5file, self)
-            ray.retrace(length, h5file=self.h5file)
+            ray = self.get_ray(rh)
+            ray.retrace(length, map=self)
 
     def plot2d(self, ax=None, marker=None, ray_color=None, ray_norm='norm', ray_linestyle='-'):
         if ax is None:
@@ -86,7 +85,7 @@ class Map2D:
         for rh in self.rays_h:
 
             try:
-                ray = load_ray(rh, self.h5file, self)
+                ray = self.get_ray(rh)
                 ray.plot(ax, marker=marker, color=ray_color, norm=ray_norm, linestyle=ray_linestyle)
             except TypeError:
                 logging.error('Unable to load ray: {: #X}'.format(rh))
@@ -114,7 +113,8 @@ class Map2D:
         if ray_norm == 'norm':
             ray_norm = self.init_beam.a0
 
-        for ray in self.rays:
+        for rh in self.rays_h:
+            ray = self.get_ray(rh)
             ray.plot3d(ax, marker=marker, color=ray_color, norm=ray_norm)
 
         # # Origin
@@ -169,7 +169,7 @@ class Map2D:
         # for rh in self.rays_h:
         for i in tqdm(range(len(self.rays_h))):
             rh = self.rays_h[i]
-            ray = load_ray(rh, self.h5file, self)
+            ray = self.get_ray(rh)
             if kind is not None:
                 if kind != ray.kind:
                     continue
@@ -195,7 +195,7 @@ class Map2D:
         # z_val = np.zeros([len(x_axis), len(y_axis)])
         #
         # for rh in self.rays_h:
-        #     ray = load_ray(rh, self.h5file, self)
+        #     ray = self.get_ray(rh)
         #     for i, t in enumerate(ray.trace):
         #         zi = np.argmin(np.abs(x_axis - t[0]))
         #         zk = np.argmin(np.abs(y_axis - t[1]))
@@ -230,3 +230,9 @@ class Map2D:
     def close_h5(self):
         """ Closes hdf5 file """
         self.h5file.close()
+
+    def get_ray(self, ray_h):
+        return load_ray(ray_h, self.h5file, self)
+
+    def save_ray(self, ray):
+        save_ray(ray, self.h5file)

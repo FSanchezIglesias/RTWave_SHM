@@ -21,7 +21,8 @@ import logging
 
 class medium:
     def __init__(self, ws, th, xi=0.,
-                 B=np.array([[1, 0, 0], [0, 1, 0]]), P=np.zeros(3)
+                 B=np.array([[1, 0, 0], [0, 1, 0]]), P=np.zeros(3),
+                 dispersive=True
                  ):
         """
         Medium definition
@@ -49,6 +50,11 @@ class medium:
         self.B = B
         self.P = P
 
+        if dispersive:
+            self.fshift = self.fshift_dispersion
+        else:
+            self.fshift = self.fshift_nd
+
     def add_objs(self, objs):
 
         for i, obj in enumerate(objs):
@@ -67,11 +73,11 @@ class medium:
             theta = np.pi+theta
 
         # logging.debug('Velocity for ray freq: {:.3e}'.format(f))
-        try:
-            return getattr(self.ws, ray.kind)((f_d, theta)) * 1.E3
-        except ValueError as e:
-            logging.error('Ray freq: {:.3e}'.format(f))
-            raise e
+        # try:
+        return getattr(self.ws, ray.kind)((f_d, theta)) * 1.E3
+        # except ValueError as e:
+        #     logging.error('Ray freq: {:.3e}'.format(f))
+        #     raise e
     
     # def tl(self, ray):
     #     # the ray has already advanced
@@ -87,9 +93,29 @@ class medium:
         a_damp = ray.a[i] * np.exp(-2*np.pi*f*self.xi*t)
         return a_damp
 
-    def dispersion(self, f, t):
-        # NOTIMPLEMENTEDDDDDD yet
-        return f
+    def fshift_dispersion(self, f, x, ray, i=-1):
+        """ Dispersion estimation based on the FFT shift property
+
+        :param f: X components of the fourier transform
+        :param x: Distance
+        :returns f_d: X components of the signal disperse
+        """
+
+        theta = np.arctan2(ray.d[i][1], ray.d[i][0])
+        if theta < 0:
+            theta = np.pi+theta
+
+        t_d = np.array([x/(getattr(self.ws, ray.kind)((fi_freq/1.E+6 * self.th, theta)) * 1.E3)
+                        for fi_freq in ray.fft_freq])
+        f_d = np.exp((0. - 1j) * 2 * np.pi * ray.fft_freq * t_d) * f
+        return f_d
+
+    def fshift_nd(self, f, x, ray, i=-1):
+        """ fft shift assuming average/non-dispersive velocity. """
+
+        v = self.v_ray(ray, i)
+        f_d = np.exp((0. - 1j) * 2 * np.pi * ray.fft_freq * x/v) * f
+        return f_d
 
     def __hash__(self):
         return self.__hash
@@ -131,7 +157,7 @@ class Segment:
         """
         self.mediums.append(medium)
 
-    def intersect(self, ray, t, h5file):
+    def intersect(self, ray, t, map):
         """
         Intersects last trace of ray with self
 
@@ -177,7 +203,7 @@ class Segment:
             # ratio_rfl = self.ratio_rfl if len(self.mediums) > 1 else 1.  # if only one medium all is reflected -> NO!
             irays_rfl, ray_params_i = ray_refl(ray, n, d, intersect, t_int, t,
                                                ratio=self.ratio_rfl, ratio_mode=self.ratio_mode,
-                                               bl=self.bl, h5file=h5file)
+                                               bl=self.bl, map=map)
             irays.extend(irays_rfl)
 
             # Refract ray on all remaining boundaries
@@ -188,7 +214,7 @@ class Segment:
                     if not m2 == ray.medium:
                         irays.extend(ray_refr(ray, n, d, intersect, t_int, t, d_i, a_i, f_i,
                                               ratio=ratio_rfr, m2=m2, ratio_mode=self.ratio_mode,
-                                              bl=self.bl, h5file=h5file))
+                                              bl=self.bl, map=map))
             # # generate opposite kind echo?
             # if rfr_ray is not None:
             #     irays.append(rfr_ray)

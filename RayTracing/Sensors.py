@@ -3,7 +3,6 @@ from utils_rays.geom_utils import seg_seg_intersect_2d, circunf_seg_intersect_2d
 import numpy as np
 from scipy.signal.windows import hamming
 import logging
-from RayTracing.Ray import load_ray
 
 
 class _StrBoundary(Segment):
@@ -173,7 +172,7 @@ class Sensor:
         if (procs is None) or (procs == 1):
             for i, [rayh, xs_ray] in enumerate(self.int_rays.items()):
 
-                ray = load_ray(rayh, self.map.h5file, self.map)
+                ray = self.map.get_ray(rayh)
 
                 signal_mat[:, i] = self._signal_on_ray(ray, xs_ray, d_x, window)
 
