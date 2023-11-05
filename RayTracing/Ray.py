@@ -17,7 +17,7 @@ class Ray:
     __slots__ = ('parent', 't',
                  'medium', 'kind', 'a', 'x',
                  'trace_points', 'd', 'int_times', 'freq',
-                 'fft_freq', 'alive')
+                 'fft_freq', 'fft_speed', 'alive')
 
     def __init__(self, origin, direction, freq, medium, t,
                  kind='S0', t0=0., a=1.,
@@ -64,6 +64,7 @@ class Ray:
         self.freq = [freq, ]
         # self.nfft = len(freq)
         self.fft_freq = rfftfreq(len(t), d=(t[-1]-t[0])/len(t))[:len(freq)]
+        self.fft_speed = np.array([self.medium.v_ray(self, fi=fi) for fi in self.fft_freq])
 
         self.alive = True
 

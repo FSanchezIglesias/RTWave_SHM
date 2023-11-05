@@ -62,12 +62,13 @@ class medium:
             if hasattr(obj, 'mediums'):
                 obj.add_medium(self)
 
-    def v_ray(self, ray, i=-1):
+    def v_ray(self, ray, i=-1, fi=None):
         # if theta is None:
         #     theta = math.atan(ray.d[i][1] / ray.d[i][0])
 
-        f = ray.fft_freq[np.argmax(np.abs(ray.freq[i]))]
-        f_d = f/1.E+6 * self.th
+        if fi is None:
+            fi = ray.fft_freq[np.argmax(np.abs(ray.freq[i]))]
+        f_d = fi/1.E+6 * self.th
         theta = np.arctan2(ray.d[i][1], ray.d[i][0])
         if theta < 0:
             theta = np.pi+theta
@@ -101,12 +102,11 @@ class medium:
         :returns f_d: X components of the signal disperse
         """
 
-        theta = np.arctan2(ray.d[i][1], ray.d[i][0])
-        if theta < 0:
-            theta = np.pi+theta
-
-        t_d = np.array([x/(getattr(self.ws, ray.kind)((fi_freq/1.E+6 * self.th, theta)) * 1.E3)
-                        for fi_freq in ray.fft_freq])
+        t_d = x/ray.fft_speed
+#        t_d = np.array([x/self.v_ray(ray, fi=fi_freq, i=i)
+#                        for fi_freq in ray.fft_freq])
+#         t_d = np.array([x/(getattr(self.ws, ray.kind)((fi_freq/1.E+6 * self.th, theta)) * 1.E3)
+#                         for fi_freq in ray.fft_freq])
         f_d = np.exp((0. - 1j) * 2 * np.pi * ray.fft_freq * t_d) * f
         return f_d
 
