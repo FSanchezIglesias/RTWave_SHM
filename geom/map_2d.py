@@ -2,6 +2,8 @@
 import logging
 from tqdm import tqdm
 import h5py
+
+import geom.objects_2d
 from utils_rays.ray_utils import split_ray, load_ray, save_ray
 import gc
 
@@ -69,8 +71,9 @@ class Map2D:
     def retrace_rays(self, length):
         """ Executes the retrace method on all rays stored in the map
         """
-        for rh in self.rays_h:
-            ray = self.get_ray(rh)
+        logging.info('Retracing {} rays for a length of: {:.2e}'.format(len(self.rays_h), length))
+        for i in tqdm(range(len(self.rays_h))):
+            ray = self.get_ray(self.rays_h[i])
             ray.retrace(length, map=self)
 
     def plot2d(self, ax=None, marker=None, ray_color=None, ray_norm='norm', ray_linestyle='-'):
@@ -132,8 +135,9 @@ class Map2D:
         return ax
 
     def plot2d_contour(self, ax=None, gridlen=2., t_ind=-1, kind=None,
-                       xmin=0, xmax=500., ymin=0., ymax=500., lvl_lim=7, lvl_N=22,
-                       err_val=0.001
+                       bounds=None, lvl_lim=None, lvl_N=22,
+#                       err_val=0.001,
+                       Nan_zero=True, border_lim=0.
                        ):
         """
 
@@ -141,13 +145,39 @@ class Map2D:
         :param gridlen: lenght grid divisions
         :param t_ind: time index
         :param kind: ray kind: 'A0', 'S0', None
-        :param xmin, xmax, ymin, ymax: Grid bounds
+        :param bounds: Grid bounds, list [xmin, xmax, ymin, ymax]
         :param lvl_lim:
-        :param err_val:
+        :param err_val: ??
+        :param Nan_zero: Plot in white the areas where no ray is computed
         :return:
         """
         import numpy as np
         from scipy.fft import irfft
+
+        if bounds is None:
+            lcx = []
+            lcy = []
+            for m in self.mediums.values():
+                for o in m.objs:
+                    if isinstance(o, geom.objects_2d.Segment):
+                        lcx.append(o.a1[0])
+                        lcx.append(o.a2[0])
+                        lcy.append(o.a1[1])
+                        lcy.append(o.a2[1])
+            xmin = min(lcx)
+            xmax = max(lcx)
+
+            ymin = min(lcy)
+            ymax = max(lcy)
+
+            xytol = border_lim*np.abs(xmax-xmin+ymax-ymin)
+            xmin -= xytol
+            xmax += xytol
+            ymin -= xytol
+            ymax += xytol
+
+        else:
+            xmin, xmax, ymin, ymax = bounds
 
         if ax is None:
             import matplotlib.pyplot as plt
@@ -162,10 +192,12 @@ class Map2D:
         args = [t_ind,
                 xmin, xmax, ngridx,
                 ymin, ymax, ngridy,
-                err_val]
+#                err_val
+                ]
 
         rays_z = []
         z_val = np.zeros(X.T.shape)
+        zi_val = np.zeros(X.T.shape)
         # for rh in self.rays_h:
         for i in tqdm(range(len(self.rays_h))):
             rh = self.rays_h[i]
@@ -174,42 +206,26 @@ class Map2D:
                 if kind != ray.kind:
                     continue
             # rays_z.append(split_ray(ray, *args))  #  for r in m.rays if r.kind != 'A0']
-            z_val += split_ray(ray, *args)
+            z_ray, zi_ray = split_ray(ray, *args)
+            z_val += z_ray
+            zi_val += zi_ray
         # z_val = sum(rays_z)
-
         if lvl_lim is None:
-            lvl_lim = np.max(z_val)
-        # levels = list(np.linspace(-lvl_lim, lvl_lim, 22))
-        levels = list(lvl_lim*np.linspace(-1,1,lvl_N)**9)
-        # tlvl = np.max(z_val / 2)
-        # levels = set([-7, *[-tlvl + tlvl / 10 * n for n in range(20)], 7])
-        # levels = list (levels)
-        # levels.sort()
-        # print(levels)
-        # if len(levels)<
-        ax.contourf(X, Y, z_val.T, vmin=-np.max(lvl_lim / 3), vmax=np.max(lvl_lim / 3), levels=levels)
+            lvl_lim = np.max(np.abs(z_val))
 
-        # x_axis = np.linspace(-gridsize/2, gridsize/2, 100)
-        # y_axis = np.linspace(-gridsize/2, gridsize/2, 100)
-        #
-        # z_val = np.zeros([len(x_axis), len(y_axis)])
-        #
-        # for rh in self.rays_h:
-        #     ray = self.get_ray(rh)
-        #     for i, t in enumerate(ray.trace):
-        #         zi = np.argmin(np.abs(x_axis - t[0]))
-        #         zk = np.argmin(np.abs(y_axis - t[1]))
-        #
-        #         z_val[zi, zk] += ray.a[i] * irfft(ray.freq[i], n=len(ray.t))[t_ind]
-        #
-        # X, Y = np.meshgrid(x_axis, y_axis)
-        # ax.contourf(X, Y, z_val)
+        # Make Nans the points where no ray is computed
+        if Nan_zero is True:
+            z_val[zi_val == 0] = np.NaN
+
+        levels = list(lvl_lim/2*np.linspace(-1, 1, lvl_N)**9)
+        ax.contourf(X, Y, z_val.T, vmin=-np.max(lvl_lim)*.6, vmax=np.max(lvl_lim)*.6, levels=levels)
+
         if self.mediums is not None:
             for m in self.mediums.values():
                 for o in m.objs:
                     o.plot(ax)
         ax.set_aspect('equal')
-        return ax, z_val, [X, Y]
+        return ax, z_val, zi_val, [X, Y]
 
     def to_vtk(self, filename, version='2.0', dtype='ASCII'):
         """ Writes paraview vtk file
@@ -218,6 +234,8 @@ class Map2D:
         :param version: Paraview vtk version file, only 2.0 supported
         :return:
         """
+        # TODO: Finish this
+        raise NotImplementedError('vtk file conversion not implemented')
 
         if version != '2.0':
             raise TypeError('Unkown version: {}'.format(version))

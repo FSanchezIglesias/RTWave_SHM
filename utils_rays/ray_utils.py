@@ -207,7 +207,7 @@ def mode_change(ray, a_new, parent=None):
 def split_ray(ray, t_ind,
               xmin, xmax, ngridx,
               ymin, ymax, ngridy,
-              err_val=0.001  # 0.1 %
+#              err_val=0.001  # 0.1 %
               ):
     """ Computes the ray values on a grid
 
@@ -234,13 +234,13 @@ def split_ray(ray, t_ind,
 
         s = ray.signal_at_i(i)
         if (zi < ngridx) and (zk < ngridy):
-            z_ray[zi, zk] += s[t_ind] if np.abs(s[t_ind]) > max(
-                np.abs(s)) * err_val else 0.  # r.a[i]*irfft(r.freq[i], n=len(r.t))[t_ind]
-            zi_ray[zi, zk] += 1
+            z_ray[zi, zk] += s[t_ind]  # if np.abs(s[t_ind]) > max(
+            #    np.abs(s)) * err_val else 0.  # r.a[i]*irfft(r.freq[i], n=len(r.t))[t_ind]
+            zi_ray[zi, zk] += 1.
 
     z_ray[zi_ray > 0] = z_ray[zi_ray > 0] / zi_ray[zi_ray > 0]
 
-    return z_ray
+    return z_ray, zi_ray
 
 
 def save_ray(ray, h5file, ray_group='rays'):

@@ -75,7 +75,7 @@ def fast_integral(x, y):
 
 
 # --- SCAN GENIE DATA PROCESSING FUNCTIONS ---
-def get_sgth(sgdata, f, path, norm=False):
+def get_sgth(sgdata, f, path, norm=False, sampling_rate=48.E+06):
     if not norm:
         norm_arr = 1.
     elif 'S' in str(norm):
@@ -89,8 +89,7 @@ def get_sgth(sgdata, f, path, norm=False):
         
     else: # Default / inp ignal
         norm_arr = np.max(np.abs(sgdata[f][path]['y']))
-        
-    
+
     return sgdata[f][path]['x']/norm_arr
 
 

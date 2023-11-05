@@ -12,6 +12,7 @@ ray_color = np.array((0.2, 0.6, 0.2, 0.7))  # default ray color
 def alive_ray(ray, i=-1):
     return (ray.a[i] > a_tol) and ray.alive
 
+
 class Ray:
     __slots__ = ('parent', 't',
                  'medium', 'kind', 'a', 'x',
@@ -442,4 +443,4 @@ class Beam:
                     self.rays.append(ray_i)
 
     def inp_signal(self):
-        return irfft(self.freq, n=len(self.t))*self.n_rays
+        return irfft(self.freq, n=len(self.t))*self.a0
