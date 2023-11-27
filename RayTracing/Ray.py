@@ -10,7 +10,10 @@ ray_color = np.array((0.2, 0.6, 0.2, 0.7))  # default ray color
 
 
 def alive_ray(ray, i=-1):
-    return (ray.a[i] > a_tol) and ray.alive
+    if ray.medium is not None:
+        return (ray.a[i] > a_tol) and ray.alive
+    else:
+        return False
 
 
 class Ray:

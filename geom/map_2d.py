@@ -10,6 +10,13 @@ import gc
 
 class Map2D:
     def __init__(self, init_beam, mediums, h5_fname=None):
+
+        if h5_fname is None:
+            from tempfile import SpooledTemporaryFile
+            h5_fname = SpooledTemporaryFile()
+        # File is opened in init
+        self.h5file = h5py.File(h5_fname, 'a')
+
         self.init_beam = init_beam
         self.mediums = {m.__hash__(): m for m in mediums}
 
@@ -22,18 +29,13 @@ class Map2D:
 
         # Calculate initial rays:
         # only simmetric
-        self.rays = self.init_beam.rays  # store the beam rays in a list
+        # self.rays = self.init_beam.rays  # store the beam rays in a list
+        # Save the rays from the initial beam
+        for r in self.init_beam.rays:
+            self.save_ray(r)
         self.rays_h = [n.__hash__() for n in self.init_beam.rays]  # store the hash keys of the rays
 
         # self.t_solved = 0.
-
-        if h5_fname is None:
-            from tempfile import SpooledTemporaryFile
-            h5_fname = SpooledTemporaryFile()
-
-        # File is opened in init
-        # Remember to run close eventually
-        self.h5file = h5py.File(h5_fname, 'a')
 
     def calc_t(self, t=None, procs=None):
         t = self.t.max() if t is None else t
@@ -46,10 +48,10 @@ class Map2D:
         # o_rays = [r for r in self.rays]  # copy the original rays to propagate
         # Propagate all rays a time t
         if (procs is None) or (procs == 1):
-            for i in tqdm(range(len(self.init_beam.rays))):
-                ray = self.init_beam.rays[i]
+            for i in tqdm(range(len(self.rays_h))):
+                ray = self.get_ray(self.rays_h[i])
                 rays_r = ray.trace(t, self)  # returns hashes
-                self.rays_h += rays_r
+                self.rays_h += rays_r  # new rays are appended always at the end
                 gc.collect()
 
         else:
@@ -67,6 +69,13 @@ class Map2D:
             # for res in rays_r:
             #     self.rays += res
         # self.t_solved = t
+
+    def calc_iter(self, N, t=None, procs=None):
+        """ Calculates the map up to t in N iterations
+        """
+        t = self.t.max() if t is None else t
+        for i in range(N):
+            self.calc_t(t=i*t/N, procs=procs)
 
     def retrace_rays(self, length):
         """ Executes the retrace method on all rays stored in the map

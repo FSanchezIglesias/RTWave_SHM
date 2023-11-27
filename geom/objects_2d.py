@@ -22,7 +22,7 @@ import logging
 class medium:
     def __init__(self, ws, th, xi=0.,
                  B=np.array([[1, 0, 0], [0, 1, 0]]), P=np.zeros(3),
-                 dispersive=True
+                 dispersive=True, theta=0.
                  ):
         """
         Medium definition
@@ -32,6 +32,8 @@ class medium:
         :param xi: damping parameter
         :param B: rotation matrix for plots
         :param P: rotation center for plots
+        :param dispersive: If true calculate dispersion
+        :para theta: Material angle orientation [rad]
         """
 
         self.ws = ws
@@ -55,11 +57,13 @@ class medium:
         else:
             self.fshift = self.fshift_nd
 
+        self.theta=theta
+
     def add_objs(self, objs):
 
         for i, obj in enumerate(objs):
             self.objs.append(obj)
-            if hasattr(obj, 'mediums'):
+            if hasattr(obj, 'add_medium'):
                 obj.add_medium(self)
 
     def v_ray(self, ray, i=-1, fi=None):
@@ -69,9 +73,8 @@ class medium:
         if fi is None:
             fi = ray.fft_freq[np.argmax(np.abs(ray.freq[i]))]
         f_d = fi/1.E+6 * self.th
-        theta = np.arctan2(ray.d[i][1], ray.d[i][0])
-        if theta < 0:
-            theta = np.pi+theta
+        theta = np.arctan2(ray.d[i][1], ray.d[i][0]) + self.theta
+        theta = theta % np.pi  # angles defined between [0, pi)
 
         # logging.debug('Velocity for ray freq: {:.3e}'.format(f))
         # try:

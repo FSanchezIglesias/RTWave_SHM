@@ -91,6 +91,7 @@ class Sensor:
 
         self.int_rays = {}
         self.map = None
+        self.medium = None
 
     def intersect(self, ray, t, h5file):
         """ Checks for intersections but rays are not altered
@@ -207,3 +208,9 @@ class Sensor:
             return self.bounds[0].c
         else:
             raise NotImplementedError('Method not implemented for sensor fo kind {}'.format(self.kind))
+
+    def add_medium(self, medium):
+        if self.medium is None:
+            self.medium = medium
+        else:
+            raise TypeError('Unable to redefine medium')

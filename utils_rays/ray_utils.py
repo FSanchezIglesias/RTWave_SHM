@@ -305,15 +305,16 @@ def load_ray(rhash, h5file, rmap, ray_group='rays'):
                   kind=dset.attrs['kind'], t0=it[0], a=a[0], parent=dset.attrs['parent'])
 
         ray.alive = dset.attrs['alive']
-        ray.a = a
-        ray.x = np.real(dset[:, 1])
-        ray.int_times = it
-        ray.trace_points = tr
-        ray.d = d
-        ray.freq = freq
+        ray.a = list(a)
+        ray.x = list(np.real(dset[:, 1]))
+        ray.int_times = list(it)
+        ray.trace_points = list(tr)
+        ray.d = list(d)
+        ray.freq = list(freq)
     else:
-        # logging.error('Error loading ray: {: #X}'.format(rhash))
-        ray = Ray(np.array([0., 0.]), direction=np.array([1., 0.]), freq=[0.], medium=None,
+        logging.error('Error loading ray: {: #X}'.format(rhash))
+        ray = Ray(np.array([0., 0.]), direction=np.array([1., 0.]), freq=[0.],
+                  medium=rmap.mediums.values()[0],  # assign random medium because the ray is dead
                   t=rmap.init_beam.t,
                   kind='', t0=0., a=0., parent=0)
         ray.alive = False
