@@ -314,9 +314,9 @@ def load_ray(rhash, h5file, rmap, ray_group='rays'):
     else:
         logging.error('Error loading ray: {: #X}'.format(rhash))
         ray = Ray(np.array([0., 0.]), direction=np.array([1., 0.]), freq=[0.],
-                  medium=rmap.mediums.values()[0],  # assign random medium because the ray is dead
+                  medium=[m for m in rmap.mediums.values()][0],  # assign random medium because the ray is dead
                   t=rmap.init_beam.t,
-                  kind='', t0=0., a=0., parent=0)
+                  kind='S0', t0=0., a=0., parent=0)
         ray.alive = False
 
     return ray
