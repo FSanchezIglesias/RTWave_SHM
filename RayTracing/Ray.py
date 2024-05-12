@@ -112,8 +112,8 @@ class Ray:
                 errormsg = 't value: {:.4e} smaller than last increment {}: {:.4e}'.format(t, i, t0)
 
             # raise TypeError(errormsg)
-            logging.error(errormsg)
-            logging.error('Ray {} is now dead, forever'.format(self))
+            logging.info(errormsg)
+            logging.info('Ray {} is now dead, forever'.format(self))
             self.alive = False
             return x0, trace0, d, f0, a0, t
 
