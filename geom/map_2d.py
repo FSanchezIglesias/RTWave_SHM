@@ -9,7 +9,7 @@ import gc
 
 
 class Map2D:
-    def __init__(self, init_beam, mediums, h5_fname=None):
+    def __init__(self, init_beam=None, mediums=(), h5_fname=None):
 
         if h5_fname is None:
             from tempfile import SpooledTemporaryFile
@@ -17,25 +17,29 @@ class Map2D:
         # File is opened in init
         self.h5file = h5py.File(h5_fname, 'a')
 
-        self.init_beam = init_beam
         self.mediums = {m.__hash__(): m for m in mediums}
 
         for m in mediums:
             for o in m.objs:
                 if hasattr(o, 'map'):
                     o.map = self  # store reference to self on objects that may need it
+        # self.t_solved = 0.
 
+        self.init_beam = None
+        self.t = [0., 0.2, 0.4, 0.6, 0.8, 1.]
+        self.rays_h = []
+
+        if init_beam is not None:
+            self.set_init_beam(init_beam)
+
+    def set_init_beam(self, init_beam):
+        self.init_beam = init_beam
         self.t = init_beam.t
 
-        # Calculate initial rays:
-        # only simmetric
-        # self.rays = self.init_beam.rays  # store the beam rays in a list
         # Save the rays from the initial beam
         for r in self.init_beam.rays:
             self.save_ray(r)
         self.rays_h = [n.__hash__() for n in self.init_beam.rays]  # store the hash keys of the rays
-
-        # self.t_solved = 0.
 
     def calc_t(self, t=None, procs=None):
         t = self.t.max() if t is None else t
@@ -263,3 +267,20 @@ class Map2D:
 
     def save_ray(self, ray):
         save_ray(ray, self.h5file)
+
+    def add_sensor(self, sens):
+        xmax_s, xmin_s, ymax_s, ymin_s = sens.get_limits()
+
+        for i, m in self.mediums.items():
+            xmax_m, xmin_m, ymax_m, ymin_m = m.get_limits()
+            # x
+            if xmax_m > xmax_s:
+                if xmin_m < xmin_s:
+                    if ymax_m > ymax_s:
+                        if ymin_m < ymin_s:
+                            # The sensor is only added to the first medium that matches
+                            m.add_objs([sens,])
+                            if hasattr(sens, 'map'):
+                                sens.map = self
+                            return
+        raise KeyError('Unable to add sensor: {}'.format(sens))

@@ -123,6 +123,24 @@ class medium:
     def __hash__(self):
         return self.__hash
 
+    def get_limits(self):
+        """
+        Limits of square medium definition on x and y
+        """
+        xmax, xmin, ymax, ymin = None, None, None, None
+
+        for obj in self.objs:
+            xmax_o, xmin_o, ymax_o, ymin_o = obj.get_limits()
+            if xmax is None:
+                xmax, xmin, ymax, ymin = xmax_o, xmin_o, ymax_o, ymin_o
+            else:
+                xmax = xmax_o if xmax_o > xmax else xmax
+                xmin = xmin_o if xmin_o < xmin else xmin
+                ymax = ymax_o if ymax_o > ymax else ymax
+                ymin = ymin_o if ymin_o < ymin else ymin
+
+        return xmax, xmin, ymax, ymin
+
 
 class Segment:
     def __init__(self, a1, a2, boundary_losses=0.2,
@@ -254,6 +272,14 @@ class Segment:
         :return:
         """
 
+    def get_limits(self):
+        xmax = max([self.a1[0], self.a2[0]])
+        xmin = min([self.a1[0], self.a2[0]])
+        ymax = max([self.a1[1], self.a2[1]])
+        ymin = min([self.a1[1], self.a2[1]])
+
+        return xmax, xmin, ymax, ymin
+
 
 class Circunf:
     def __init__(self, c, r, color='black'):
@@ -275,6 +301,12 @@ class Circunf:
 
         if marker is not None:
             ax.plot(self.c[0], self.c[1], marker=marker, color=color)
+
+    def get_limits(self):
+        """
+        Limits of square medium definition on x and y
+        """
+        return self.c[0]+self.r, self.c[0]-self.r, self.c[1]+self.r, self.c[1]-self.r
 
 
 class Polygon:

@@ -213,4 +213,24 @@ class Sensor:
         if self.medium is None:
             self.medium = medium
         else:
-            raise TypeError('Unable to redefine medium')
+            raise TypeError('Sensor:{} already has a medium defined.'.format(self))
+
+    def get_limits(self):
+        """
+        Limits of square definition on x and y
+        """
+        xmax, xmin, ymax, ymin = None, None, None, None
+
+        for obj in self.bounds:
+            xmax_o, xmin_o, ymax_o, ymin_o = obj.get_limits()
+            if xmax is None:
+                xmax, xmin, ymax, ymin = xmax_o, xmin_o, ymax_o, ymin_o
+            else:
+                xmax = xmax_o if xmax_o > xmax else xmax
+                xmin = xmin_o if xmin_o < xmin else xmin
+                ymax = ymax_o if ymax_o > ymax else ymax
+                ymin = ymin_o if ymin_o < ymin else ymin
+
+        return xmax, xmin, ymax, ymin
+
+
