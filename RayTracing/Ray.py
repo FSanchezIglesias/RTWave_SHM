@@ -448,3 +448,17 @@ class Beam:
 
     def inp_signal(self):
         return irfft(self.freq, n=len(self.t))*self.a0
+
+
+class Beam_from_pzt(Beam):
+    def __init__(self, n_rays, pzt,
+                 signal_f=burst_hann, freq=None,
+                 power=1., kind='all', **kwargs):
+
+        self.source = pzt
+        params = [pzt.origin(), ]
+        medium = pzt.medium
+
+        Beam.__init__(self, n_rays=n_rays, params=params, medium=medium,
+                      signal_f=signal_f, freq=freq,
+                      power=power, kind=kind, b_type='circ', **kwargs)

@@ -40,19 +40,27 @@ class _CircBoundary(Circunf):
 
 class Sensor:
 
-    def __init__(self, kind, params, sensitivity=1.,
+    def __init__(self, kind, params, sensitivity=1., name=None,
                  color='red', **kwargs):
         """
         Sensor is for now a rectangle defined by 4 corners
         :param kind: string:
                 - 'rect' - Rectangle
                 - 'sq' - Square
+                - 'circ' - circle
         :param params: parameters to define the sensor boundary:
                 - rectangle: 4 points [[a1, a2], [b1, b2], [c1, c2], [d1, d2]] ordered in a rhs motion
-                - square: center and radius [[o1, o2], r]-> to form a square tho...
+                - square: center and radius [[o1, o2], r] -> to form a square tho...
+                - circle: center and radius [[o1, o2], r]
         """
         self.bounds = []
         self.kind = kind.lower()
+
+        if name is not None:
+            self.name = name
+        else:
+            import names
+            self.name = names.get_full_name()
 
         if 'rect' in self.kind:
             self.bounds.append(_StrBoundary(params[0], params[1], color=color))
@@ -92,6 +100,8 @@ class Sensor:
         self.int_rays = {}
         self.map = None
         self.medium = None
+
+        self.signal_s = None
 
     def intersect(self, ray, t, h5file):
         """ Checks for intersections but rays are not altered
@@ -190,8 +200,9 @@ class Sensor:
                 signal_mat[:, i] = res.get()
 
         signal = signal_mat.sum(axis=1)
+        self.signal_s = signal * self.sensitivity
 
-        return signal * self.sensitivity
+        return self.signal_s
 
     # def
     

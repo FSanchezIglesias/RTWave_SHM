@@ -3,6 +3,7 @@ import logging
 from tqdm import tqdm
 import h5py
 
+import RayTracing.Sensors
 import geom.objects_2d
 from utils_rays.ray_utils import split_ray, load_ray, save_ray
 import gc
@@ -18,11 +19,14 @@ class Map2D:
         self.h5file = h5py.File(h5_fname, 'a')
 
         self.mediums = {m.__hash__(): m for m in mediums}
+        self.sensors = []
 
         for m in mediums:
             for o in m.objs:
                 if hasattr(o, 'map'):
                     o.map = self  # store reference to self on objects that may need it
+                if isinstance(o, RayTracing.Sensors.Sensor):
+                    self.sensors.append(o)
         # self.t_solved = 0.
 
         self.init_beam = None
@@ -80,6 +84,17 @@ class Map2D:
         t = self.t.max() if t is None else t
         for i in range(N):
             self.calc_t(t=i*t/N, procs=procs)
+
+    def calc_signal(self, calc_source=False):
+        """
+        Calculates the signal of all sensors from the map
+        """
+        for s in self.sensors:
+            if not calc_source and s == self.init_beam.source:
+                print('ignoring sensor {}'.format(s.name))
+                continue
+
+            s.signal()
 
     def retrace_rays(self, length):
         """ Executes the retrace method on all rays stored in the map
@@ -268,6 +283,28 @@ class Map2D:
     def save_ray(self, ray):
         save_ray(ray, self.h5file)
 
+    def save_signals(self, fname, key='', format='hdf'):
+        """
+        Saves the sensors signals on a file
+        :param fname: Filename
+        :param key: HDF file name path
+        :param format: only hdf supported
+        :return:
+        """
+
+        import pandas as pd
+
+        if format != 'hdf':
+            raise TypeError('Unknown format {}'.format(format))
+
+        sensors_s = {}
+        for s in self.sensors:
+            if s.signal_s is not None:
+                sensors_s[s.name] = s.signal_s
+
+        sensors_signaldf = pd.DataFrame(sensors_s)
+        sensors_signaldf.to_hdf(fname, key=key)
+
     def add_sensor(self, sens):
         xmax_s, xmin_s, ymax_s, ymin_s = sens.get_limits()
 
@@ -279,8 +316,9 @@ class Map2D:
                     if ymax_m > ymax_s:
                         if ymin_m < ymin_s:
                             # The sensor is only added to the first medium that matches
-                            m.add_objs([sens,])
+                            m.add_objs([sens, ])
                             if hasattr(sens, 'map'):
                                 sens.map = self
+                            self.sensors.append(sens)
                             return
         raise KeyError('Unable to add sensor: {}'.format(sens))
