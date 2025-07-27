@@ -1,4 +1,4 @@
-from utils_rays.geom_utils import dot_2d, norm_2d
+from geom.geom_utils import dot_2d, norm_2d
 from RayTracing.Ray import Ray
 import math
 import numpy as np

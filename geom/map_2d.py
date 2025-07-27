@@ -1,10 +1,12 @@
 # import numpy as np
 import logging
+
+import numpy as np
 from tqdm import tqdm
 import h5py
 
 import RayTracing.Sensors
-import geom.objects_2d
+from geom import objects_2d
 from utils_rays.ray_utils import split_ray, load_ray, save_ray
 import gc
 
@@ -58,25 +60,32 @@ class Map2D:
         if (procs is None) or (procs == 1):
             for i in tqdm(range(len(self.rays_h))):
                 ray = self.get_ray(self.rays_h[i])
-                rays_r = ray.trace(t, self)  # returns hashes
+                rays_r = self.trace_ray(ray, t)  # returns hashes
                 self.rays_h += rays_r  # new rays are appended always at the end
-                gc.collect()
 
         else:
             raise NotImplementedError
 
-            # from multiprocessing import Pool
-            # p = Pool(procs)
-            # r = []
-            #
-            # for ray in o_rays:
-            #     args = [t, self.objs]
-            #     r.append(p.apply_async(ray.trace, args))
-            #
-            # rays_r = [res.get() for res in r]
-            # for res in rays_r:
-            #     self.rays += res
+            from multiprocessing import Pool
+            p = Pool(procs)
+            r = []
+
+            for rhash in self.rays_h:
+                ray = self.get_ray(rhash)
+                args = [self, ray, t]
+                r.append(p.apply_async(self.trace_ray, args))
+
+            rays_r = [res.get() for res in r]
+            for rays_h in rays_r:
+                self.rays_h += rays_h
         # self.t_solved = t
+
+    def trace_ray(self, ray, t):
+        """ Traces a ray included in map
+        """
+        rays_r = ray.trace(t, self)  # returns hashes
+        gc.collect()
+        return rays_r
 
     def calc_iter(self, N, t=None, procs=None):
         """ Calculates the map up to t in N iterations
@@ -164,7 +173,7 @@ class Map2D:
 
     def plot2d_contour(self, ax=None, gridlen=2., t_ind=-1, kind=None,
                        bounds=None, lvl_lim=None, lvl_N=22,
-#                       err_val=0.001,
+                       # err_val=0.001,
                        Nan_zero=True, border_lim=0.
                        ):
         """
@@ -180,14 +189,13 @@ class Map2D:
         :return:
         """
         import numpy as np
-        from scipy.fft import irfft
 
         if bounds is None:
             lcx = []
             lcy = []
             for m in self.mediums.values():
                 for o in m.objs:
-                    if isinstance(o, geom.objects_2d.Segment):
+                    if isinstance(o, objects_2d.Segment):
                         lcx.append(o.a1[0])
                         lcx.append(o.a2[0])
                         lcy.append(o.a1[1])
@@ -283,7 +291,7 @@ class Map2D:
     def save_ray(self, ray):
         save_ray(ray, self.h5file)
 
-    def save_signals(self, fname, key='', format='hdf'):
+    def save_signals(self, fname, key='', format='hdf', use_pandas=False):
         """
         Saves the sensors signals on a file
         :param fname: Filename
@@ -292,18 +300,30 @@ class Map2D:
         :return:
         """
 
-        import pandas as pd
-
         if format != 'hdf':
             raise TypeError('Unknown format {}'.format(format))
 
-        sensors_s = {}
+        sensors_s = []
+        sensors_l = []
         for s in self.sensors:
             if s.signal_s is not None:
-                sensors_s[s.name] = s.signal_s
+                sensors_s.append(s.signal_s)
+                sensors_l.append(s.name)
+        sensors_s = np.array(sensors_s).T
 
-        sensors_signaldf = pd.DataFrame(sensors_s)
-        sensors_signaldf.to_hdf(fname, key=key)
+        if use_pandas:
+            import pandas as pd
+            sensors_signaldf = pd.DataFrame(sensors_s, index=self.t, columns=sensors_l)
+            sensors_signaldf.to_hdf(fname, key=key)
+        else:
+            import h5py
+
+            with h5py.File(fname, 'a') as h5f:
+                if key in h5f:
+                    raise KeyError('HDF5 file already contains a dataset with the same key: {}'.format(key))
+                else:
+                    h5f[key] = sensors_s
+                    h5f[key].attrs['columns'] = sensors_l
 
     def add_sensor(self, sens):
         xmax_s, xmin_s, ymax_s, ymin_s = sens.get_limits()

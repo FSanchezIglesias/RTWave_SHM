@@ -1,6 +1,6 @@
 import numpy as np
 from scipy.fft import rfft, rfftfreq, irfft
-from utils_rays.geom_utils import norm_2d
+from geom.geom_utils import norm_2d
 # from utils_rays.ray_utils import save_ray
 from RayTracing.Signal import burst_hann
 import logging

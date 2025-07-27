@@ -1,5 +1,5 @@
 from geom.objects_2d import Segment, Circunf
-from utils_rays.geom_utils import seg_seg_intersect_2d, circunf_seg_intersect_2d, dot_2d
+from geom.geom_utils import seg_seg_intersect_2d, circunf_seg_intersect_2d, dot_2d
 import numpy as np
 from scipy.signal.windows import hamming
 import logging

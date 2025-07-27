@@ -4,6 +4,7 @@ Code for simulation of elastic wave propagation on thin plates via ray tracing
 ## Simple usage example
 
 ### Import the objects to be used
+
 ```python
 from geom.objects_2d import Segment, medium
 from RayTracing.Sensors import Sensor

@@ -1,8 +1,8 @@
 import numpy as np
-import math
-from utils_rays.geom_utils import seg_seg_intersect_2d, norm_2d, cross_2d
+# import math
+from geom.geom_utils import seg_seg_intersect_2d, norm_2d, cross_2d
 from utils_rays.ray_utils import ray_refl, ray_refr
-import logging
+
 
 # class Plane:
 #     def __init__(self, point, normal, color):
