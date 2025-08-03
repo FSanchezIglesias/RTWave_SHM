@@ -12,7 +12,9 @@ import gc
 
 
 class Map2D:
-    def __init__(self, init_beam=None, mediums=(), h5_fname=None):
+    def __init__(self, init_beam=None, mediums=(), h5_fname=None, background=False):
+
+        self.background=background
 
         if h5_fname is None:
             from tempfile import SpooledTemporaryFile
@@ -58,7 +60,7 @@ class Map2D:
         # o_rays = [r for r in self.rays]  # copy the original rays to propagate
         # Propagate all rays a time t
         if (procs is None) or (procs == 1):
-            for i in tqdm(range(len(self.rays_h))):
+            for i in tqdm(range(len(self.rays_h)), disable=self.background):
                 ray = self.get_ray(self.rays_h[i])
                 rays_r = self.trace_ray(ray, t)  # returns hashes
                 self.rays_h += rays_r  # new rays are appended always at the end
@@ -109,7 +111,7 @@ class Map2D:
         """ Executes the retrace method on all rays stored in the map
         """
         logging.info('Retracing {} rays for a length of: {:.2e}'.format(len(self.rays_h), length))
-        for i in tqdm(range(len(self.rays_h))):
+        for i in tqdm(range(len(self.rays_h)), disable=self.background):
             ray = self.get_ray(self.rays_h[i])
             ray.retrace(length, map=self)
 
@@ -235,7 +237,7 @@ class Map2D:
         z_val = np.zeros(X.T.shape)
         zi_val = np.zeros(X.T.shape)
         # for rh in self.rays_h:
-        for i in tqdm(range(len(self.rays_h))):
+        for i in tqdm(range(len(self.rays_h)), disable=self.background):
             rh = self.rays_h[i]
             ray = self.get_ray(rh)
             if kind is not None:
