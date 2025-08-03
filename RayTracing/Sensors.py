@@ -176,6 +176,7 @@ class Sensor:
         """
 
         if not self.int_rays:
+            logging.info('No rays intersecting sensor {}'.format(self.name))
             return None
 
         # Time must be equal for all model, its taken from map

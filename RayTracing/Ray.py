@@ -104,7 +104,8 @@ class Ray:
         #    raise TypeError("Missing 1 required keyword argument: 't' or 'x'")
 
         if t < t0:
-            logging.debug('\n'.join(['{:.2e} - ({:.2e}, {:.2e})'.format(w1, w2[0], w2[1])
+            logging.debug('Ray {}: int_time - (trace ori, trace end):'.format(self) +
+                          '\n'.join(['{:.2e} - ({:.2e}, {:.2e})'.format(w1, w2[0], w2[1])
                                      for w1, w2 in zip(self.int_times, self.trace_points)]))
             if x is not None:
                 errormsg = 't value: {:.4e} smaller than last increment {}: {:.4e}, for x: {:.3e}'.format(t, i, t0, x)
@@ -112,8 +113,8 @@ class Ray:
                 errormsg = 't value: {:.4e} smaller than last increment {}: {:.4e}'.format(t, i, t0)
 
             # raise TypeError(errormsg)
-            logging.info(errormsg)
-            logging.info('Ray {} is now dead, forever'.format(self))
+            logging.debug(errormsg)
+            logging.debug('Ray {} is now dead, forever'.format(self))
             self.alive = False
             return x0, trace0, d, f0, a0, t
 
