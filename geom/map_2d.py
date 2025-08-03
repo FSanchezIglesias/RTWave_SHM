@@ -34,7 +34,7 @@ class Map2D:
         # self.t_solved = 0.
 
         self.init_beam = None
-        self.t = [0., 0.2, 0.4, 0.6, 0.8, 1.]
+        self.t = [0., 0.2, 0.4, 0.6, 0.8, 1.]  # It is overwritten by the time defined in init_beam
         self.rays_h = []
 
         if init_beam is not None:
@@ -60,6 +60,7 @@ class Map2D:
         # o_rays = [r for r in self.rays]  # copy the original rays to propagate
         # Propagate all rays a time t
         if (procs is None) or (procs == 1):
+            logging.info('Solving trace up to {:.3E} s for {} rays'.format(t, len(self.rays_h)))
             for i in tqdm(range(len(self.rays_h)), disable=self.background):
                 ray = self.get_ray(self.rays_h[i])
                 rays_r = self.trace_ray(ray, t)  # returns hashes
@@ -102,7 +103,7 @@ class Map2D:
         """
         for s in self.sensors:
             if not calc_source and s == self.init_beam.source:
-                print('ignoring sensor {}'.format(s.name))
+                logging.warning('ignoring sensor {}'.format(s.name))
                 continue
 
             s.signal()

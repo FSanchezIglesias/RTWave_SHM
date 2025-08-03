@@ -170,15 +170,19 @@ class Sensor:
         Considers only rays that cut twice
         :param t: time points
         :param d_x: integration step
+        :param procs: number of proc for parallel
+        :param window: integration window for ray power function, default 'hsphere'
         :return: measured signal
         """
 
         if not self.int_rays:
             return None
 
-        # Time must be equal for all model, its defined on a random ray
-        t = self.map.init_beam.t
+        # Time must be equal for all model, its taken from map
+        t = self.map.t
         signal_mat = np.zeros([len(t), len(self.int_rays)])
+
+        logging.info('Calc signal on sensor {}. Integrating over {} rays'.format(self.name, len(self.int_rays)))
 
         if (procs is None) or (procs == 1):
             for i, [rayh, xs_ray] in enumerate(self.int_rays.items()):
