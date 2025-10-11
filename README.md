@@ -1,6 +1,18 @@
 # RTWave_SHM
 Code for simulation of elastic wave propagation on thin plates via ray tracing
 
+## Install
+To install simply clone from github
+
+```bash
+git clone https://github.com/FSanchezIglesias/RTWave_SHM.git code
+```
+
+or:
+```bash
+git clone git@github.com:FSanchezIglesias/RTWave_SHM.git code
+```
+
 ## Simple usage example
 
 ### Import the objects to be used
