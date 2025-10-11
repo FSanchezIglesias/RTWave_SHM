@@ -1,8 +1,9 @@
 import numpy as np
-import math
-from utils_rays.geom_utils import seg_seg_intersect_2d, norm_2d, cross_2d
+
+# import math
+from geom.geom_utils import seg_seg_intersect_2d, norm_2d, cross_2d
 from utils_rays.ray_utils import ray_refl, ray_refr
-import logging
+
 
 # class Plane:
 #     def __init__(self, point, normal, color):
@@ -42,6 +43,7 @@ class medium:
 
         # List of objects contained in the medium
         self.objs = []
+        self.sensors = []
 
         # random value based on medium thickness and xi,
         # because I don't want to implement hashing on the wave speed function
@@ -62,7 +64,10 @@ class medium:
     def add_objs(self, objs):
 
         for i, obj in enumerate(objs):
-            self.objs.append(obj)
+            if hasattr(obj, 'signal'):
+                self.sensors.append(obj)
+            else:
+                self.objs.append(obj)
             if hasattr(obj, 'add_medium'):
                 obj.add_medium(self)
 

@@ -1,16 +1,20 @@
 # import numpy as np
 import logging
+
+import numpy as np
 from tqdm import tqdm
 import h5py
 
 import RayTracing.Sensors
-import geom.objects_2d
+from geom import objects_2d
 from utils_rays.ray_utils import split_ray, load_ray, save_ray
 import gc
 
 
 class Map2D:
-    def __init__(self, init_beam=None, mediums=(), h5_fname=None):
+    def __init__(self, init_beam=None, mediums=(), h5_fname=None, background=False):
+
+        self.background=background
 
         if h5_fname is None:
             from tempfile import SpooledTemporaryFile
@@ -56,27 +60,34 @@ class Map2D:
         # o_rays = [r for r in self.rays]  # copy the original rays to propagate
         # Propagate all rays a time t
         if (procs is None) or (procs == 1):
-            for i in tqdm(range(len(self.rays_h))):
+            for i in tqdm(range(len(self.rays_h)), disable=self.background):
                 ray = self.get_ray(self.rays_h[i])
-                rays_r = ray.trace(t, self)  # returns hashes
+                rays_r = self.trace_ray(ray, t)  # returns hashes
                 self.rays_h += rays_r  # new rays are appended always at the end
-                gc.collect()
 
         else:
             raise NotImplementedError
 
-            # from multiprocessing import Pool
-            # p = Pool(procs)
-            # r = []
-            #
-            # for ray in o_rays:
-            #     args = [t, self.objs]
-            #     r.append(p.apply_async(ray.trace, args))
-            #
-            # rays_r = [res.get() for res in r]
-            # for res in rays_r:
-            #     self.rays += res
+            from multiprocessing import Pool
+            p = Pool(procs)
+            r = []
+
+            for rhash in self.rays_h:
+                ray = self.get_ray(rhash)
+                args = [self, ray, t]
+                r.append(p.apply_async(self.trace_ray, args))
+
+            rays_r = [res.get() for res in r]
+            for rays_h in rays_r:
+                self.rays_h += rays_h
         # self.t_solved = t
+
+    def trace_ray(self, ray, t):
+        """ Traces a ray included in map
+        """
+        rays_r = ray.trace(t, self)  # returns hashes
+        gc.collect()
+        return rays_r
 
     def calc_iter(self, N, t=None, procs=None):
         """ Calculates the map up to t in N iterations
@@ -100,11 +111,12 @@ class Map2D:
         """ Executes the retrace method on all rays stored in the map
         """
         logging.info('Retracing {} rays for a length of: {:.2e}'.format(len(self.rays_h), length))
-        for i in tqdm(range(len(self.rays_h))):
+        for i in tqdm(range(len(self.rays_h)), disable=self.background):
             ray = self.get_ray(self.rays_h[i])
-            ray.retrace(length, map=self)
+            ray.retrace(length, r_map=self)
 
     def plot2d(self, ax=None, marker=None, ray_color=None, ray_norm='norm', ray_linestyle='-'):
+
         if ax is None:
             import matplotlib.pyplot as plt
             fig, ax = plt.subplots(figsize=(16, 9))
@@ -129,6 +141,8 @@ class Map2D:
             for m in self.mediums.values():
                 for o in m.objs:
                     o.plot(ax, marker=marker)
+                for s in m.sensors:
+                    s.plot(ax, marker=marker)
 
         ax.set_aspect('equal')
 
@@ -164,7 +178,7 @@ class Map2D:
 
     def plot2d_contour(self, ax=None, gridlen=2., t_ind=-1, kind=None,
                        bounds=None, lvl_lim=None, lvl_N=22,
-#                       err_val=0.001,
+                       # err_val=0.001,
                        Nan_zero=True, border_lim=0.
                        ):
         """
@@ -180,14 +194,13 @@ class Map2D:
         :return:
         """
         import numpy as np
-        from scipy.fft import irfft
 
         if bounds is None:
             lcx = []
             lcy = []
             for m in self.mediums.values():
                 for o in m.objs:
-                    if isinstance(o, geom.objects_2d.Segment):
+                    if isinstance(o, objects_2d.Segment):
                         lcx.append(o.a1[0])
                         lcx.append(o.a2[0])
                         lcy.append(o.a1[1])
@@ -227,7 +240,7 @@ class Map2D:
         z_val = np.zeros(X.T.shape)
         zi_val = np.zeros(X.T.shape)
         # for rh in self.rays_h:
-        for i in tqdm(range(len(self.rays_h))):
+        for i in tqdm(range(len(self.rays_h)), disable=self.background):
             rh = self.rays_h[i]
             ray = self.get_ray(rh)
             if kind is not None:
@@ -283,7 +296,7 @@ class Map2D:
     def save_ray(self, ray):
         save_ray(ray, self.h5file)
 
-    def save_signals(self, fname, key='', format='hdf'):
+    def save_signals(self, fname, key='', format='hdf', use_pandas=False):
         """
         Saves the sensors signals on a file
         :param fname: Filename
@@ -292,18 +305,30 @@ class Map2D:
         :return:
         """
 
-        import pandas as pd
-
         if format != 'hdf':
             raise TypeError('Unknown format {}'.format(format))
 
-        sensors_s = {}
+        sensors_s = []
+        sensors_l = []
         for s in self.sensors:
             if s.signal_s is not None:
-                sensors_s[s.name] = s.signal_s
+                sensors_s.append(s.signal_s)
+                sensors_l.append(s.name)
+        sensors_s = np.array(sensors_s).T
 
-        sensors_signaldf = pd.DataFrame(sensors_s)
-        sensors_signaldf.to_hdf(fname, key=key)
+        if use_pandas:
+            import pandas as pd
+            sensors_signaldf = pd.DataFrame(sensors_s, index=self.t, columns=sensors_l)
+            sensors_signaldf.to_hdf(fname, key=key)
+        else:
+            import h5py
+
+            with h5py.File(fname, 'a') as h5f:
+                if key in h5f:
+                    raise KeyError('HDF5 file already contains a dataset with the same key: {}'.format(key))
+                else:
+                    h5f[key] = sensors_s
+                    h5f[key].attrs['columns'] = sensors_l
 
     def add_sensor(self, sens):
         xmax_s, xmin_s, ymax_s, ymin_s = sens.get_limits()

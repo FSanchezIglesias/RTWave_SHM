@@ -1,6 +1,6 @@
 import numpy as np
 from scipy.fft import rfft, rfftfreq, irfft
-from utils_rays.geom_utils import norm_2d
+from geom.geom_utils import norm_2d
 # from utils_rays.ray_utils import save_ray
 from RayTracing.Signal import burst_hann
 import logging
@@ -130,7 +130,7 @@ class Ray:
 
         return self.x[i] + x_i, trace_i, d_i, f_i, a_i, t
 
-    def trace(self, t, map):
+    def trace(self, t, r_map):
         """
 
         :param t: time to advance ray (sorry)
@@ -150,17 +150,25 @@ class Ray:
         # -- keep track of new rays --
         rfr_rays = []
 
-        for obj in self.medium.objs:
-            rfr_rays.extend(obj.intersect(self, t, map))
+        for sens in self.medium.sensors:
+            # rfr_rays.extend(obj.intersect(self, t, r_map)) # sensors don't interact
+            sens.intersect(self, t, r_map)
 
-        map.save_ray(self)  # saves ray
+        for obj in self.medium.objs:
+            inter = obj.intersect(self, t, r_map)
+            if inter:
+                rfr_rays.extend(inter)
+                break
+
+        r_map.save_ray(self)  # saves ray
         return rfr_rays
 
-    def retrace(self, length, map):
+    def retrace(self, length, r_map):
         """ Calculates additional n points inbetween traces
 
         # :param n: number of points
         :param length: "approximate" length for retracing
+        :param r_map: ray map
         :return: None
         """
 
@@ -201,7 +209,7 @@ class Ray:
         self.freq = freq
         self.a = a
 
-        map.save_ray(self)  # saves ray
+        r_map.save_ray(self)  # saves ray
 
     def set_param(self, x, trace, d, f, a, t, i=None):
         """ Sets the ray parameters after each iteration

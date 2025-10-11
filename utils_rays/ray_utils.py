@@ -1,4 +1,4 @@
-from utils_rays.geom_utils import dot_2d, norm_2d
+from geom.geom_utils import dot_2d, norm_2d
 from RayTracing.Ray import Ray
 import math
 import numpy as np
@@ -253,16 +253,13 @@ def save_ray(ray, h5file, ray_group='rays'):
     """
 
     # Matrix stuff
-    a = ray.a
-    x = ray.x
-    int_t = ray.int_times
-    tr_points = ray.trace_points  # vector nx2
-    d = ray.d  # vector nx2
-    freq = ray.freq  # vector nxm
+    # ray.trace_points  # vector nx2
+    # ray.d  # vector nx2
+    # ray.freq  # vector nxm
 
-    mat = np.column_stack([a, x, int_t])
+    mat = np.column_stack([ray.a, ray.x, ray.int_times])
     try:
-        mat = np.concatenate([mat, tr_points, d, freq], axis=1)
+        mat = np.concatenate([mat, ray.trace_points, ray.d, ray.freq], axis=1)
     except:
         logging.error('Unable to save Ray: {: #X}'.format(ray.__hash__()))
         return None
@@ -271,7 +268,7 @@ def save_ray(ray, h5file, ray_group='rays'):
         dset = h5file.create_dataset(ray_group + '/' + str(ray.__hash__()), data=mat, maxshape=(None, mat.shape[1]))
         # Attributes
         # dset.attrs['t'] = ray.t
-        dset.attrs['medium'] = ray.medium.__hash__()  # to float beacuse precision length.... it shouldnt be a problem here?
+        dset.attrs['medium'] = ray.medium.__hash__()
         dset.attrs['kind'] = ray.kind
         dset.attrs['parent'] = ray.parent  # .__hash__()
         # dset.attrs['fftf'] = ray.fft_freq
