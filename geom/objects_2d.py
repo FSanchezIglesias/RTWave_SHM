@@ -1,8 +1,8 @@
 import numpy as np
 
 # import math
-from geom.geom_utils import seg_seg_intersect_2d, norm_2d, cross_2d
-from utils_rays.ray_utils import ray_refl, ray_refr
+from RTWave_SHM.geom.geom_utils import seg_seg_intersect_2d, norm_2d, cross_2d
+from RTWave_SHM.utils_rays.ray_utils import ray_refl, ray_refr
 
 
 # class Plane:
@@ -41,6 +41,10 @@ class medium:
         self.th = th  # mm
         self.xi = xi
 
+        # Pre-cached lookups for hot-path (v_ray / tl)
+        self._th_factor = th / 1.E+6
+        self._ws_func = {'S0': ws.S0, 'A0': ws.A0}
+
         # List of objects contained in the medium
         self.objs = []
         self.sensors = []
@@ -72,21 +76,13 @@ class medium:
                 obj.add_medium(self)
 
     def v_ray(self, ray, i=-1, fi=None):
-        # if theta is None:
-        #     theta = math.atan(ray.d[i][1] / ray.d[i][0])
-
         if fi is None:
-            fi = ray.fft_freq[np.argmax(np.abs(ray.freq[i]))]
-        f_d = fi/1.E+6 * self.th
+            fi = ray._dom_freq
+        f_d = fi * self._th_factor
         theta = np.arctan2(ray.d[i][1], ray.d[i][0]) + self.theta
         theta = theta % np.pi  # angles defined between [0, pi)
 
-        # logging.debug('Velocity for ray freq: {:.3e}'.format(f))
-        # try:
-        return getattr(self.ws, ray.kind)((f_d, theta)) * 1.E3
-        # except ValueError as e:
-        #     logging.error('Ray freq: {:.3e}'.format(f))
-        #     raise e
+        return self._ws_func[ray.kind]((f_d, theta)) * 1.E3
     
     # def tl(self, ray):
     #     # the ray has already advanced
@@ -95,11 +91,12 @@ class medium:
     #     a_damp = ray.a[-1] * np.exp(-2*np.pi*ray.freq[-1]*self.xi*t)
     #     return a_damp
     
-    def tl(self, ray, i, t):
+    def tl(self, ray, i, t, fi=None):
         # the ray has already advanced
         # Rays only stay on a single medium
-        f = ray.fft_freq[np.argmax(np.abs(ray.freq[i]))]
-        a_damp = ray.a[i] * np.exp(-2*np.pi*f*self.xi*t)
+        if fi is None:
+            fi = ray._dom_freq
+        a_damp = ray.a[i] * np.exp(-2*np.pi*fi*self.xi*t)
         return a_damp
 
     def fshift_dispersion(self, f, x, ray, i=-1):
@@ -110,12 +107,7 @@ class medium:
         :returns f_d: X components of the signal disperse
         """
 
-        t_d = x/ray.fft_speed
-#        t_d = np.array([x/self.v_ray(ray, fi=fi_freq, i=i)
-#                        for fi_freq in ray.fft_freq])
-#         t_d = np.array([x/(getattr(self.ws, ray.kind)((fi_freq/1.E+6 * self.th, theta)) * 1.E3)
-#                         for fi_freq in ray.fft_freq])
-        f_d = np.exp((0. - 1j) * 2 * np.pi * ray.fft_freq * t_d) * f
+        f_d = np.exp(ray._phase_coeff * x) * f
         return f_d
 
     def fshift_nd(self, f, x, ray, i=-1):
@@ -371,4 +363,3 @@ class Circle:
     def plot(self, ax):
         for seg in self.segs:
             seg.plot(ax, color=self.color)
-

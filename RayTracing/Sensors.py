@@ -1,6 +1,7 @@
-from geom.objects_2d import Segment, Circunf
-from geom.geom_utils import seg_seg_intersect_2d, circunf_seg_intersect_2d, dot_2d
+from RTWave_SHM.geom.objects_2d import Segment, Circunf
+from RTWave_SHM.geom.geom_utils import seg_seg_intersect_2d, circunf_seg_intersect_2d, dot_2d
 import numpy as np
+from scipy.fft import irfft
 from scipy.signal.windows import hamming
 import logging
 
@@ -123,47 +124,82 @@ class Sensor:
         return []
 
     def _signal_on_ray(self, ray, xs_ray, d_x, window=None):
-        # if len(xs_ray) % 2:
-        #     # odd number of cuts, this is bad
-        #     # print('error on ray{}'.format(ray.ID))
-        #     continue
 
-        xs_ray = set(xs_ray)
-        xs_ray = sorted(xs_ray)  # make a set and sort all items
+        xs_ray = sorted(set(xs_ray))
+        n_t = len(ray.t)
 
-        sig_i = []
+        if len(xs_ray) < 2:
+            return np.zeros(n_t)
 
-        # get all the segments:
-        # xs_ray is (should be) always ordered in pairs
-        # ( A ray may cut the sensor more than twice )
-        for i in range(len(xs_ray) // 2):
-            # x_sig = 0.5 * (xs_ray[2*i+1] + xs_ray[2*i])
-            xi = np.arange(xs_ray[2 * i], xs_ray[2 * i + 1], d_x) + d_x / 2
-            D_ray = np.abs(xs_ray[2 * i] - xs_ray[2 * i + 1])
-            
+        # --- Ray-level constants (computed once for all crossing pairs) ---
+        phase_coeff = ray._phase_coeff  # [n_fft] complex, precomputed on ray
+        t_vec = ray.t
+        medium = ray.medium
+        x_list = ray.x
+
+        total = np.zeros(n_t)
+
+        for pair_idx in range(len(xs_ray) // 2):
+            x_entry = xs_ray[2 * pair_idx]
+            x_exit  = xs_ray[2 * pair_idx + 1]
+
+            xi = np.arange(x_entry, x_exit, d_x) + d_x / 2
+            n_pts = xi.size
+            if n_pts == 0:
+                continue
+
+            D_ray = abs(x_exit - x_entry)
+
+            # Window (same logic as original)
             if window == 'hamming':
-                w = hamming(xi.size)
-            # elif window == 'double_hamming':
-            #     w = hamming(xi.size)
-            #     w * /self.size
+                w = hamming(n_pts)
             elif window == 'hsphere':
-                w = hamming(xi.size)
-                w *= D_ray/self.size
+                w = hamming(n_pts)
+                w *= D_ray / self.size
             else:
-                w = np.ones(xi.shape)
-            # l_sig = abs(xs_ray[2*i+1] - xs_ray[2*i])
-            # int_c = math.ceil(l_sig/d_x)
-            # li_sig = l_sig/int_c  # do this again because int
-            # for x_int in np.linspace(xs_ray[2*i], xs_ray[2*i+1], int_c+1)[:-1] + li_sig/2:
-            for i_w, x in enumerate(xi):
-                # sig_i = integral(t, ray.signal_at_x(t, x_int))  # Integrate the signal in time
-                try:
-                    sig_i.append(ray.signal_at_x(x) * d_x * w[i_w])
-                except StopIteration:
-                    logging.error('Unable to get signal for ray: {} at x: {:.3f}'.format(hash(ray), x))
-                    continue
+                w = np.ones(n_pts)
 
-        return sum(sig_i)
+            # Find segment index once for all points in this crossing pair
+            try:
+                seg_idx = next(j for j, v in enumerate(x_list) if v > xi[0]) - 1
+            except StopIteration:
+                logging.error('Unable to get signal for ray: {} at x: {:.3f}'.format(
+                    hash(ray), xi[0]))
+                continue
+
+            # --- Segment-level constants (computed once per crossing pair) ---
+            x0 = x_list[seg_idx]
+            f0 = ray.freq[seg_idx]
+            a0 = ray.a[seg_idx]
+            t0 = ray.int_times[seg_idx]
+            v  = medium.v_ray(ray, seg_idx)
+            xi_over_v = medium.xi / v
+            damping_rate = 2 * np.pi * ray._dom_freq * xi_over_v
+
+            # --- Per-point loop with step-recurrence for phase and damping ---
+            # Each iteration needs exp(phase_coeff * dx_k) — instead of recomputing
+            # n_pts complex exponentials per step, advance by one spatial step via
+            # multiplication:  exp(phase * (dx + d_x)) = exp(phase * dx) * exp(phase * d_x)
+            # This replaces (n_pts - 1) × n_fft complex exp calls with cheap in-place
+            # multiplications (~5–10× faster than exp).
+            dx_k     = xi - x0                                         # [n_pts]
+            mask_idx = np.searchsorted(t_vec, (t0 + dx_k / v) / 2)   # [n_pts]
+            w_dx     = d_x * w                                         # [n_pts]
+
+            step_phase = np.exp(phase_coeff * d_x)                    # [n_fft], once
+            step_amp   = np.exp(-damping_rate * d_x)                  # scalar,  once
+
+            cur_f   = np.exp(phase_coeff * dx_k[0]) * f0              # [n_fft]
+            cur_amp = a0 * np.exp(-damping_rate * dx_k[0])            # scalar
+
+            for k in range(n_pts):
+                s = cur_amp * w_dx[k] * irfft(cur_f, n=n_t)
+                s[:mask_idx[k]] = 0
+                total += s
+                cur_f   *= step_phase   # n_fft complex mults, no exp
+                cur_amp *= step_amp     # 1 scalar mult
+
+        return total
 
     def signal(self, d_x=0.1, procs=None, window='hsphere'):
         """ Measure signal at sensor
@@ -248,5 +284,3 @@ class Sensor:
                 ymin = ymin_o if ymin_o < ymin else ymin
 
         return xmax, xmin, ymax, ymin
-
-

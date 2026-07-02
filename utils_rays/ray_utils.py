@@ -1,5 +1,6 @@
-from geom.geom_utils import dot_2d, norm_2d
-from RayTracing.Ray import Ray
+from RTWave_SHM.geom.geom_utils import dot_2d, norm_2d
+from RTWave_SHM.RayTracing.Ray import Ray, a_tol
+from scipy.fft import rfftfreq
 import math
 import numpy as np
 import logging
@@ -23,26 +24,44 @@ def ray_refl(ray, n, d, intersect, t_int, t,
     """
     irays = []
 
-    # --- Reflection ---
-    # Specular reflection
-    # rfl_dir = - dot_2d(ray.d, self.n)*self.n + dot_2d(ray.d, self.d)*self.d
-    rfl_dir = - dot_2d(ray.d[-1], n) * n + dot_2d(ray.d[-1], d) * d
-
-    # Replace parameters for intersection point of incident ray
+    # Compute ray params at intersection first — needed by caller for refraction
     ray_params_i = ray.calc_ray(t_int, i=-2)
     x_i, trace_i, d_i, f_i, a_i, t_i = ray_params_i
 
+    a_rfl = a_i * ratio * ratio_mode * (1 - bl)
+    a_mc = a_i * ratio * (1 - ratio_mode) * (1 - bl)
+
+    # Early-return for invisible walls (ratio_rfl=0): skip direction compute + dead trace
+    if a_rfl <= a_tol and a_mc <= a_tol:
+        ray.set_param(x_i, intersect, d_i, f_i, 0.0, t_int, i=-1)
+        return irays, ray_params_i
+
+    # --- Reflection ---
+    # Specular reflection
+    rfl_dir = - dot_2d(ray.d[-1], n) * n + dot_2d(ray.d[-1], d) * d
+
+    # FIX: Normalize direction and add small offset (nudge)
+    rfl_dir_norm = rfl_dir / norm_2d(rfl_dir)
+    epsilon = 1e-8
+    intersect_safe = intersect + rfl_dir_norm * epsilon
+
     ray.set_param(x_i,
-                  intersect,  # forced
-                  rfl_dir / norm_2d(rfl_dir),  # updated direction
+                  intersect_safe,  # forced to safe offset
+                  rfl_dir_norm,    # updated direction
                   f_i,
-                  a_i * ratio * ratio_mode * (1 - bl),
+                  a_rfl,
                   t_int, i=-1)
 
+    # Refresh dispersion coefficients for the new (reflected) direction
+    # so that subsequent fshift_dispersion calls use the correct
+    # anisotropic group-velocity curve.
+    ray._update_phase_coeff()
+
     # Mode change of reflection:
-    ray_mc = mode_change(ray, a_i * ratio * (1 - ratio_mode) * (1 - bl))
-    irays.append(ray_mc.__hash__())
-    irays.extend(ray_mc.trace(t, map))
+    if a_mc > a_tol:
+        ray_mc = mode_change(ray, a_mc)
+        irays.append(ray_mc.__hash__())
+        irays.extend(ray_mc.trace(t, map))
 
     # Propagate original ray to t, once the direction and everything else is modified
     irays.extend(ray.trace(t, map))
@@ -74,6 +93,14 @@ def ray_refr(ray, n, d, intersect, t_int, t, rd, ra, rf,
     :return: refracted rays, if any
     """
 
+    # Pre-compute amplitudes to avoid unnecessary work
+    a_rfr = ra * ratio * ratio_mode * (1 - bl)
+    a_rfr_mc = ra * ratio * (1 - ratio_mode) * (1 - bl)
+
+    # Skip entirely if neither refracted ray would survive
+    if a_rfr <= a_tol and a_rfr_mc <= a_tol:
+        return []
+
     # material impedance ratios thing for Snell's law v2/v1
     # TODO: maybe try to fix this for composite
     v2_v1 = m2.v_ray(ray) / \
@@ -92,18 +119,36 @@ def ray_refr(ray, n, d, intersect, t_int, t, rd, ra, rf,
     if abs(sin_theta_r) <= 1.:
         # print( ray.d, self.n, np.arcsin(sin_theta_i)*180/np.pi, np.arcsin(sin_theta_r)*180/np.pi)
         rfr_dir = math.cos(math.asin(sin_theta_r)) * n + sin_theta_r * d
+        
+        # FIX: Normalize direction and add small offset (nudge)
+        rfr_dir_norm = rfr_dir / norm_2d(rfr_dir)
+        epsilon = 1e-8
+        intersect_safe = intersect + rfr_dir_norm * epsilon
 
-        # Generate refracted ray
-        ray_refr = Ray(intersect, rfr_dir, freq=rf, medium=m2, t=ray.t, t0=t_int, kind=ray.kind,
-                       a=ra * ratio*ratio_mode*(1-bl), parent=ray)
-        ray_refr_mc = mode_change(ray_refr, ra * ratio*(1-ratio_mode)*(1-bl), parent=ray)
+        if a_rfr > a_tol:
+            # Generate refracted ray
+            ray_refr = Ray(intersect_safe, rfr_dir_norm, freq=rf, medium=m2, t=ray.t, t0=t_int, kind=ray.kind,
+                           a=a_rfr, parent=ray, _fft_freq=ray.fft_freq)
 
-        # Propagate rays to t
-        # this is a trace method so new rays could be generated here and must be captured
-        irays.append(ray_refr.__hash__())
-        irays.extend(ray_refr.trace(t, map))
-        irays.append(ray_refr_mc.__hash__())
-        irays.extend(ray_refr_mc.trace(t, map))
+            # mode_change must read ray_refr's INITIAL state, before .trace() mutates it
+            if a_rfr_mc > a_tol:
+                ray_refr_mc = mode_change(ray_refr, a_rfr_mc, parent=ray)
+
+            # Now trace both
+            irays.append(ray_refr.__hash__())
+            irays.extend(ray_refr.trace(t, map))
+
+            if a_rfr_mc > a_tol:
+                irays.append(ray_refr_mc.__hash__())
+                irays.extend(ray_refr_mc.trace(t, map))
+
+        elif a_rfr_mc > a_tol:
+            # Only the mode-changed refracted ray survives — still need a base ray for mode_change
+            ray_refr = Ray(intersect_safe, rfr_dir_norm, freq=rf, medium=m2, t=ray.t, t0=t_int, kind=ray.kind,
+                           a=a_rfr, parent=ray, _fft_freq=ray.fft_freq)
+            ray_refr_mc = mode_change(ray_refr, a_rfr_mc, parent=ray)
+            irays.append(ray_refr_mc.__hash__())
+            irays.extend(ray_refr_mc.trace(t, map))
 
     # end function and return refraction or new modes if any
     return irays
@@ -199,7 +244,7 @@ def mode_change(ray, a_new, parent=None):
                  freq=ray.freq[-1].copy(),
                  medium=ray.medium, t=ray.t, t0=ray.int_times[-1],
                  kind='A0' if ray.kind == 'S0' else 'S0',
-                 a=a_new, parent=parent)
+                 a=a_new, parent=parent, _fft_freq=ray.fft_freq)
 
     return mc_ray
 
@@ -297,10 +342,16 @@ def load_ray(rhash, h5file, rmap, ray_group='rays'):
         a, it, tr, d, freq = np.real(dset[:, 0]), np.real(dset[:, 2]), np.real(dset[:, 3:5]),\
             np.real(dset[:, 5:7]), dset[:, 7:]
 
-        ray = Ray(origin=tr[0, :], direction=d[0, :], freq=freq[0, :], medium=rmap.mediums[dset.attrs['medium']],
-                  t=rmap.init_beam.t,
-                  kind=dset.attrs['kind'], t0=it[0], a=a[0], parent=dset.attrs['parent'])
+        medium = rmap.mediums[dset.attrs['medium']]
+        kind = dset.attrs['kind']
+        t = rmap.init_beam.t
 
+        # Bypass __init__ — populate slots directly from HDF5 data
+        ray = Ray.__new__(Ray)
+        ray.parent = dset.attrs['parent']
+        ray.t = t
+        ray.medium = medium
+        ray.kind = kind
         ray.alive = dset.attrs['alive']
         ray.a = list(a)
         ray.x = list(np.real(dset[:, 1]))
@@ -308,13 +359,57 @@ def load_ray(rhash, h5file, rmap, ray_group='rays'):
         ray.trace_points = list(tr)
         ray.d = list(d)
         ray.freq = list(freq)
+
+        # fft_freq: share from beam if available, else compute
+        nfft = freq.shape[1]
+        if rmap.init_beam is not None and len(rmap.init_beam.fft_freq) == nfft:
+            ray.fft_freq = rmap.init_beam.fft_freq
+        else:
+            ray.fft_freq = rfftfreq(len(t), d=(t[-1] - t[0]) / len(t))[:nfft]
+
+        # fft_speed: batch interpolation when available
+        theta = np.arctan2(d[0, 1], d[0, 0]) + medium.theta
+        theta = theta % np.pi
+        th_factor = medium.th / 1.E+6
+
+        if hasattr(medium.ws, 'batch_speed'):
+            x_vals = np.ascontiguousarray(ray.fft_freq * th_factor)
+            ray.fft_speed = medium.ws.batch_speed(kind, x_vals, theta) * 1.E3
+        else:
+            ws_func = getattr(medium.ws, kind)
+            ray.fft_speed = np.array([ws_func((fi * th_factor, theta)) * 1.E3
+                                      for fi in ray.fft_freq])
+
+        # Restore cached hash
+        ray._hash = rhash
+
+        # Dominant frequency — invariant (fshift only rotates phases)
+        ray._dom_freq_idx = np.argmax(np.abs(freq[0]))
+        ray._dom_freq = ray.fft_freq[ray._dom_freq_idx]
+
+        # Dispersion phase coefficient
+        ray._phase_coeff = (-0. - 1j) * 2 * np.pi * ray.fft_freq / ray.fft_speed
+
     else:
         logging.debug('Error loading ray: {: #X}'.format(rhash))
-        ray = Ray(np.array([0., 0.]), direction=np.array([1., 0.]), freq=[0.],
-                  medium=[m for m in rmap.mediums.values()][0],  # assign random medium because the ray is dead
-                  t=rmap.init_beam.t,
-                  kind='S0', t0=0., a=0., parent=0)
+        # Dead ray — skip all expensive computation
+        ray = Ray.__new__(Ray)
+        ray.parent = 0
+        ray.t = rmap.init_beam.t
+        ray.medium = next(iter(rmap.mediums.values()))
+        ray.kind = 'S0'
         ray.alive = False
+        ray.a = [0.]
+        ray.x = [0.]
+        ray.int_times = [0.]
+        ray.trace_points = [np.array([0., 0.])]
+        ray.d = [np.array([1., 0.])]
+        ray.freq = [np.zeros(1)]
+        ray.fft_freq = np.zeros(1)
+        ray.fft_speed = np.zeros(1)
+        ray._hash = rhash
+        ray._dom_freq_idx = 0
+        ray._dom_freq = 0.
+        ray._phase_coeff = np.zeros(1, dtype=np.complex128)
 
     return ray
-
