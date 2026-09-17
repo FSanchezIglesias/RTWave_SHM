@@ -1,6 +1,7 @@
 from geom.objects_2d import Segment, Circunf
 from geom.geom_utils import seg_seg_intersect_2d, circunf_seg_intersect_2d, dot_2d
 import numpy as np
+from scipy.fft import irfft
 from scipy.signal.windows import hamming
 import logging
 
@@ -123,47 +124,114 @@ class Sensor:
         return []
 
     def _signal_on_ray(self, ray, xs_ray, d_x, window=None):
-        # if len(xs_ray) % 2:
-        #     # odd number of cuts, this is bad
-        #     # print('error on ray{}'.format(ray.ID))
-        #     continue
+        """Integrate the signal carried by ``ray`` over its crossings of the sensor.
 
-        xs_ray = set(xs_ray)
-        xs_ray = sorted(xs_ray)  # make a set and sort all items
+        ``xs_ray`` holds the ray-path coordinates at which the ray crossed the
+        sensor boundary; they are sorted and taken in (entry, exit) pairs. Each
+        chord is sampled every ``d_x`` (mid-point rule) and weighted by
+        ``window``.
 
-        sig_i = []
+        The semantics are those of the original per-point implementation
+        (``Ray.signal_at_x``): every integration point uses the ray event
+        (segment) it lies in, points at or beyond the last recorded ray
+        position are skipped, and the dispersion coefficient is the one of that
+        segment's direction (``Ray.phase_coeff_at``). Within a run of
+        consecutive points on the same segment the phase and damping factors
+        are advanced by a step recurrence instead of re-evaluating the
+        exponentials at every point.
+        """
+        xs_ray = sorted(set(xs_ray))
+        n_t = len(ray.t)
 
-        # get all the segments:
-        # xs_ray is (should be) always ordered in pairs
-        # ( A ray may cut the sensor more than twice )
-        for i in range(len(xs_ray) // 2):
-            # x_sig = 0.5 * (xs_ray[2*i+1] + xs_ray[2*i])
-            xi = np.arange(xs_ray[2 * i], xs_ray[2 * i + 1], d_x) + d_x / 2
-            D_ray = np.abs(xs_ray[2 * i] - xs_ray[2 * i + 1])
-            
+        if len(xs_ray) < 2:
+            return np.zeros(n_t)
+
+        t_vec = ray.t
+        medium = ray.medium
+        x_arr = np.asarray(ray.x, dtype=float)
+        x_last = x_arr[-1]
+
+        total = np.zeros(n_t)
+
+        for pair_idx in range(len(xs_ray) // 2):
+            x_entry = xs_ray[2 * pair_idx]
+            x_exit = xs_ray[2 * pair_idx + 1]
+
+            xi = np.arange(x_entry, x_exit, d_x) + d_x / 2
+            n_pts = xi.size
+            if n_pts == 0:
+                continue
+
+            D_ray = abs(x_exit - x_entry)
+
             if window == 'hamming':
-                w = hamming(xi.size)
-            # elif window == 'double_hamming':
-            #     w = hamming(xi.size)
-            #     w * /self.size
+                w = hamming(n_pts)
             elif window == 'hsphere':
-                w = hamming(xi.size)
-                w *= D_ray/self.size
+                w = hamming(n_pts)
+                w *= D_ray / self.size
             else:
-                w = np.ones(xi.shape)
-            # l_sig = abs(xs_ray[2*i+1] - xs_ray[2*i])
-            # int_c = math.ceil(l_sig/d_x)
-            # li_sig = l_sig/int_c  # do this again because int
-            # for x_int in np.linspace(xs_ray[2*i], xs_ray[2*i+1], int_c+1)[:-1] + li_sig/2:
-            for i_w, x in enumerate(xi):
-                # sig_i = integral(t, ray.signal_at_x(t, x_int))  # Integrate the signal in time
-                try:
-                    sig_i.append(ray.signal_at_x(x) * d_x * w[i_w])
-                except StopIteration:
-                    logging.error('Unable to get signal for ray: {} at x: {:.3f}'.format(hash(ray), x))
-                    continue
+                w = np.ones(n_pts)
+            w_dx = d_x * w
 
-        return sum(sig_i)
+            # Ray event (segment) containing each point: last event with x <= xi.
+            # Points at/after the ray's last position have no segment (v1 skipped them).
+            seg_of = np.searchsorted(x_arr, xi, side='right') - 1
+            valid = (seg_of >= 0) & (xi < x_last)
+            n_skip = int(n_pts - valid.sum())
+            if n_skip:
+                logging.error('Unable to get signal for ray: {} at {} of {} points '
+                              '(beyond ray end x = {:.3f})'.format(hash(ray), n_skip,
+                                                                   n_pts, x_last))
+
+            # Integrate runs of consecutive valid points lying on the same segment
+            k = 0
+            while k < n_pts:
+                if not valid[k]:
+                    k += 1
+                    continue
+                seg_idx = int(seg_of[k])
+                k_end = k + 1
+                while k_end < n_pts and valid[k_end] and seg_of[k_end] == seg_idx:
+                    k_end += 1
+                self._integrate_run(ray, seg_idx, xi[k:k_end], w_dx[k:k_end], d_x,
+                                    t_vec, medium, total)
+                k = k_end
+
+        return total
+
+    @staticmethod
+    def _integrate_run(ray, seg_idx, xi, w_dx, d_x, t_vec, medium, total):
+        """Accumulate into ``total`` the contribution of the points ``xi``.
+
+        ``xi`` are uniformly spaced by ``d_x`` and all lie on ray segment
+        ``seg_idx`` (the one starting at event ``seg_idx``). Phase and damping
+        are advanced by a step recurrence:
+        ``exp(alpha*(dx + d_x)) = exp(alpha*dx) * exp(alpha*d_x)``.
+        """
+        n_t = total.size
+        x0 = ray.x[seg_idx]
+        f0 = ray.freq[seg_idx]
+        a0 = ray.a[seg_idx]
+        t0 = ray.int_times[seg_idx]
+        v = medium.v_ray(ray, seg_idx)
+        damping_rate = 2 * np.pi * ray._dom_freq * medium.xi / v
+        phase_coeff = ray.phase_coeff_at(seg_idx)          # [n_fft] complex
+
+        dx_k = xi - x0                                        # [n_pts]
+        mask_idx = np.searchsorted(t_vec, (t0 + dx_k / v) / 2)  # [n_pts]
+
+        step_phase = np.exp(phase_coeff * d_x)               # [n_fft], once per run
+        step_amp = np.exp(-damping_rate * d_x)               # scalar, once per run
+
+        cur_f = np.exp(phase_coeff * dx_k[0]) * f0           # [n_fft]
+        cur_amp = a0 * np.exp(-damping_rate * dx_k[0])       # scalar
+
+        for k in range(xi.size):
+            s = cur_amp * w_dx[k] * irfft(cur_f, n=n_t)
+            s[:mask_idx[k]] = 0
+            total += s
+            cur_f *= step_phase      # n_fft complex mults, no exp
+            cur_amp *= step_amp      # 1 scalar mult
 
     def signal(self, d_x=0.1, procs=None, window='hsphere'):
         """ Measure signal at sensor
@@ -248,5 +316,3 @@ class Sensor:
                 ymin = ymin_o if ymin_o < ymin else ymin
 
         return xmax, xmin, ymax, ymin
-
-

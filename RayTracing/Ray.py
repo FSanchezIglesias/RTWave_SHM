@@ -8,6 +8,13 @@ import logging
 a_tol = 1.e-8  # tolerance for living (ABSOLUTE)
 ray_color = np.array((0.2, 0.6, 0.2, 0.7))  # default ray color
 
+# If True, a ray's dispersion curve (``fft_speed``/``_phase_coeff``) is
+# recomputed for the new propagation direction after every reflection, so an
+# anisotropic medium disperses each segment with the curve of its own angle.
+# If False, the curve of the birth direction is kept for the ray's whole life
+# (behaviour of the original v1 solver).
+dispersion_follows_direction = True
+
 
 def alive_ray(ray, i=-1):
     if ray.medium is not None:
@@ -20,7 +27,8 @@ class Ray:
     __slots__ = ('parent', 't',
                  'medium', 'kind', 'a', 'x',
                  'trace_points', 'd', 'int_times', 'freq',
-                 'fft_freq', 'fft_speed', 'alive')
+                 'fft_freq', 'fft_speed', 'alive', '_hash',
+                 '_dom_freq_idx', '_dom_freq', '_phase_coeff')
 
     def __init__(self, origin, direction, freq, medium, t,
                  kind='S0', t0=0., a=1.,
@@ -66,10 +74,84 @@ class Ray:
         self.int_times = [t0, ]
         self.freq = [freq, ]
         # self.nfft = len(freq)
-        self.fft_freq = rfftfreq(len(t), d=(t[-1]-t[0])/len(t))[:len(freq)]
-        self.fft_speed = np.array([self.medium.v_ray(self, fi=fi) for fi in self.fft_freq])
+        # Share fft_freq across rays — compute only if not provided
+        _fft_freq = kwargs.get('_fft_freq', None)
+        if _fft_freq is not None and len(_fft_freq) == len(freq):
+            self.fft_freq = _fft_freq
+        else:
+            self.fft_freq = rfftfreq(len(t), d=(t[-1]-t[0])/len(t))[:len(freq)]
+
+        # Dispersion curve and phase coefficient for the birth direction:
+        # f_shifted = exp(_phase_coeff * distance) * f
+        self.fft_speed, self._phase_coeff = self._dispersion_for_direction(self.d[0])
 
         self.alive = True
+
+        # Dominant frequency bin — invariant because fshift only rotates phases
+        self._dom_freq_idx = np.argmax(np.abs(freq))
+        self._dom_freq = self.fft_freq[self._dom_freq_idx]
+
+        # Cache hash — computed once, uses immutable initial state
+        self._hash = hash(hash(self.kind) + hash(tuple(self.d[0])) +
+                          hash(tuple(self.trace_points[0])) + hash(self.int_times[0]) +
+                          hash(tuple(self.freq[0])))
+
+    def _dispersion_for_direction(self, d) -> tuple:
+        """Phase-velocity array and dispersion coefficient for direction ``d``.
+
+        :param d: unit direction vector (2 components)
+        :return: ``(fft_speed, phase_coeff)``; ``fft_speed[k]`` is the phase
+                 velocity of FFT bin ``k`` (geometry length unit per second,
+                 i.e. mm/s) and ``phase_coeff = -2j*pi*fft_freq/fft_speed`` so
+                 that ``exp(phase_coeff * x) * f`` disperses spectrum ``f`` over
+                 a distance ``x``.
+        """
+        medium = self.medium
+        theta = (np.arctan2(d[1], d[0]) + medium.theta) % np.pi
+        th_factor = medium.th / 1.E+6
+
+        # Batch interpolation: single Numba call instead of n_fft Python round-trips
+        if hasattr(medium.ws, 'batch_speed'):
+            x_vals = np.ascontiguousarray(self.fft_freq * th_factor)
+            fft_speed = medium.ws.batch_speed(self.kind, x_vals, theta) * 1.E3
+        else:
+            ws_func = getattr(medium.ws, self.kind)
+            fft_speed = np.array([ws_func((fi * th_factor, theta)) * 1.E3
+                                  for fi in self.fft_freq])
+
+        # nan_to_num guards against 0/0 at the DC bin (fft_speed -> 0 at f = 0)
+        phase_coeff = np.nan_to_num(
+            (-0. - 1j) * 2 * np.pi * self.fft_freq / fft_speed,
+            nan=0.0, posinf=0.0, neginf=0.0,
+        )
+        return fft_speed, phase_coeff
+
+    def _update_phase_coeff(self) -> None:
+        """Recompute ``fft_speed`` and ``_phase_coeff`` for the current
+        direction ``d[-1]``.
+
+        Called by ``ray_refl`` after a reflection when
+        ``dispersion_follows_direction`` is True, so that the segment that
+        starts at the reflection point is dispersed with the curve of its own
+        propagation angle. ``fft_speed``/``_phase_coeff`` therefore describe
+        the *last* segment of the ray; use ``phase_coeff_at`` for earlier ones.
+        """
+        self.fft_speed, self._phase_coeff = self._dispersion_for_direction(self.d[-1])
+
+    def phase_coeff_at(self, i: int) -> np.ndarray:
+        """Dispersion coefficient valid on the segment that starts at event ``i``.
+
+        During tracing the segment starting at event ``i`` was propagated with
+        the coefficient of direction ``d[i]`` (updated at reflections only when
+        ``dispersion_follows_direction`` is True). Signal reconstruction must
+        use the same coefficient to stay consistent with the stored spectra.
+        """
+        if not dispersion_follows_direction:
+            return self._phase_coeff
+        d_i = self.d[i]
+        if np.array_equal(d_i, self.d[-1]):
+            return self._phase_coeff
+        return self._dispersion_for_direction(d_i)[1]
 
     def v_ray(self, i=-1):
         return self.medium.v_ray(self, i)
@@ -90,7 +172,9 @@ class Ray:
         a0 = self.a[i]
         d = self.d[i]
 
-        v = self.v_ray(i)  # only freq / when i=-1 gets previous inc
+        # Dominant frequency — cached, invariant across ray lifetime
+        fi = self._dom_freq
+        v = self.medium.v_ray(self, i, fi=fi)
 
         if x is None:
             x_i = v * (t - t0)
@@ -127,7 +211,7 @@ class Ray:
         f_i = self.medium.fshift(f0, x_i, self, i)
 
         # Transmission loss
-        a_i = self.medium.tl(self, i, t - t0)
+        a_i = self.medium.tl(self, i, t - t0, fi=fi)
 
         return self.x[i] + x_i, trace_i, d_i, f_i, a_i, t
 
@@ -357,10 +441,7 @@ class Ray:
                         color=color, marker=marker)
 
     def __hash__(self, *args, **kwargs):
-        # define ray hash - Kind + direction + origin + birthdate + freq parameters
-        # hash of hashes to avoid super large python ints
-        return hash(hash(self.kind) + hash(tuple(self.d[0])) + \
-                    hash(tuple(self.trace_points[0])) + hash(self.int_times[0]) + hash(tuple(self.freq[0])))
+        return self._hash
 
     def __repr__(self):
         return 'Ray {: #X}'.format(self.__hash__())
@@ -406,7 +487,7 @@ class Beam:
             # default is 5 periods with 100 points per period
             self.t = kwargs.get('t', np.arange(0, 1/fd*5, 1/(100*f)))
             self.nfft = kwargs.get('nfft', 50)
-            s = signal_f(self.t, self.a0, f, fd)
+            s = signal_f(self.t, 1.0, f, fd)
 
             self.freq = rfft(s)[:self.nfft]
         else:
@@ -445,14 +526,17 @@ class Beam:
 
                 if kind not in ['S0', 'A0']:
                     ray_a = Ray(origin=self.o, direction=d, freq=self.freq, t=self.t,
-                                medium=medium, kind='A0', a=self.a0, nfft=self.nfft)
+                                medium=medium, kind='A0', a=self.a0, nfft=self.nfft,
+                                _fft_freq=self.fft_freq)
                     ray_s = Ray(origin=self.o, direction=d, freq=self.freq, t=self.t,
-                                medium=medium, kind='S0', a=self.a0, nfft=self.nfft)
+                                medium=medium, kind='S0', a=self.a0, nfft=self.nfft,
+                                _fft_freq=self.fft_freq)
                     self.rays.append(ray_a)
                     self.rays.append(ray_s)
                 else:
                     ray_i = Ray(origin=self.o, direction=d, freq=self.freq, t=self.t,
-                                medium=medium, kind=kind, a=self.a0, nfft=self.nfft)
+                                medium=medium, kind=kind, a=self.a0, nfft=self.nfft,
+                                _fft_freq=self.fft_freq)
                     self.rays.append(ray_i)
 
     def inp_signal(self):

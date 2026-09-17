@@ -1,0 +1,14 @@
+python Run_SQ48_row.py 46.50 > log_row46_50.txt &
+python Run_SQ48_row.py 69.00 > log_row69_00.txt &
+python Run_SQ48_row.py 91.50 > log_row91_50.txt &
+python Run_SQ48_row.py 114.00 > log_row114_00.txt &
+python Run_SQ48_row.py 136.50 > log_row136_50.txt &
+python Run_SQ48_row.py 159.00 > log_row159_00.txt &
+python Run_SQ48_row.py 181.50 > log_row181_50.txt &
+python Run_SQ48_row.py 204.00 > log_row204_00.txt &
+python Run_SQ48_row.py 226.50 > log_row226_50.txt &
+python Run_SQ48_row.py 249.00 > log_row249_00.txt &
+python Run_SQ48_row.py 271.50 > log_row271_50.txt &
+python Run_SQ48_row.py 294.00 > log_row294_00.txt &
+python Run_SQ48_row.py 316.50 > log_row316_50.txt &
+python Run_SQ48_row.py 339.00 > log_row339_00.txt &

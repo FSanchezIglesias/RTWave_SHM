@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "archify-scratchpad",
+      "runtimeExecutable": "C:\\Users\\DdRV\\venvs\\PhD\\Scripts\\python.exe",
+      "runtimeArgs": [
+        "-m",
+        "http.server",
+        "8935",
+        "--directory",
+        "C:\\Users\\DdRV\\AppData\\Local\\Temp\\claude\\C--Users-DdRV-Documents-GitHub-Paper-RayTracing-Damage-Characterization-Documented-GLW-Optimization\\d802d617-0fe3-4958-a18b-4029d4f6a826\\scratchpad"
+      ],
+      "port": 8935
+    }
+  ]
+}

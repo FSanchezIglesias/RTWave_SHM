@@ -1,0 +1,286 @@
+from RTWave_SHM.geom.objects_2d import Segment, Circunf
+from RTWave_SHM.geom.geom_utils import seg_seg_intersect_2d, circunf_seg_intersect_2d, dot_2d
+import numpy as np
+from scipy.fft import irfft
+from scipy.signal.windows import hamming
+import logging
+
+
+class _StrBoundary(Segment):
+    def intersect_sens(self, ray):
+        intersect = seg_seg_intersect_2d(ray.trace_points[-2], ray.trace_points[-1], self.a1, self.a2)
+        if intersect is None:
+            return None
+
+        # t_int = norm_2d(intersect - ray.trace[-2]) /
+        # norm_2d(ray.trace[-1] - ray.trace[-2]) * (t - ray.int_times[-2]) \
+        #         + ray.int_times[-2]
+        x_int = ray.x[-2] + dot_2d(intersect - ray.trace_points[-2], ray.d[-2])
+
+        return [x_int, ]  # return as a list for compatibility
+
+
+class _CircBoundary(Circunf):
+    def intersect_sens(self, ray):
+
+        intersect = circunf_seg_intersect_2d(self.c, self.r, ray.trace_points[-2], ray.trace_points[-1])
+        if not intersect:
+            return None
+
+        # t_int = norm_2d(intersect - ray.trace[-2]) / norm_2d(ray.trace[-1] - ray.trace[-2]) *
+        # (t - ray.int_times[-2]) \
+        #         + ray.int_times[-2]
+        x_int = []
+
+        # Distance travelled over ray
+        for i in intersect:
+            x_int.append(ray.x[-2] + dot_2d(i - ray.trace_points[-2], ray.d[-2]))
+
+        return x_int
+
+
+class Sensor:
+
+    def __init__(self, kind, params, sensitivity=1., name=None,
+                 color='red', **kwargs):
+        """
+        Sensor is for now a rectangle defined by 4 corners
+        :param kind: string:
+                - 'rect' - Rectangle
+                - 'sq' - Square
+                - 'circ' - circle
+        :param params: parameters to define the sensor boundary:
+                - rectangle: 4 points [[a1, a2], [b1, b2], [c1, c2], [d1, d2]] ordered in a rhs motion
+                - square: center and radius [[o1, o2], r] -> to form a square tho...
+                - circle: center and radius [[o1, o2], r]
+        """
+        self.bounds = []
+        self.kind = kind.lower()
+
+        if name is not None:
+            self.name = name
+        else:
+            import names
+            self.name = names.get_full_name()
+
+        if 'rect' in self.kind:
+            self.bounds.append(_StrBoundary(params[0], params[1], color=color))
+            self.bounds.append(_StrBoundary(params[1], params[2], color=color))
+            self.bounds.append(_StrBoundary(params[2], params[3], color=color))
+            self.bounds.append(_StrBoundary(params[3], params[0], color=color))
+
+            self.size = np.average([n.length for n in self.bounds])
+
+        elif 'sq' in self.kind:
+            o = np.array(params[0])
+            r = params[1]
+            p = [o + np.array([-r, -r]), o + np.array([r, -r]),
+                 o + np.array([r, r]), o + np.array([-r, r])]
+
+            self.bounds.append(_StrBoundary(p[0], p[1], color=color))
+            self.bounds.append(_StrBoundary(p[1], p[2], color=color))
+            self.bounds.append(_StrBoundary(p[2], p[3], color=color))
+            self.bounds.append(_StrBoundary(p[3], p[0], color=color))
+
+            self.size = np.average([n.length for n in self.bounds])
+        elif 'circ' in self.kind:
+            o = np.array(params[0])
+            r = params[1]
+            self.bounds.append(_CircBoundary(o, r, color=color))
+
+            self.size = 2*r
+
+        else:
+            raise NotImplementedError('Unknown sensor of kind: {}'.format(kind))
+
+        self.sensitivity = sensitivity/self.size  # hmmmm....
+
+        # # Maybe this should be something else...
+        # self.int_size = kwargs.get('int_size', self.size / kwargs.get('int_n', 10))
+
+        self.int_rays = {}
+        self.map = None
+        self.medium = None
+
+        self.signal_s = None
+
+    def intersect(self, ray, t, h5file):
+        """ Checks for intersections but rays are not altered
+        :param ray: Ray object
+        :param t: maintains sig of other intersect methods
+        :param h5file: maintains sig of other intersect methods
+        :return: empty list
+        """
+
+        for b in self.bounds:
+            int_points = b.intersect_sens(ray)
+            if int_points is not None:
+                if ray.__hash__() in self.int_rays.keys():
+                    for xi in int_points:
+                        self.int_rays[ray.__hash__()].append(xi)
+                else:
+                    self.int_rays[ray.__hash__()] = int_points
+
+        return []
+
+    def _signal_on_ray(self, ray, xs_ray, d_x, window=None):
+
+        xs_ray = sorted(set(xs_ray))
+        n_t = len(ray.t)
+
+        if len(xs_ray) < 2:
+            return np.zeros(n_t)
+
+        # --- Ray-level constants (computed once for all crossing pairs) ---
+        phase_coeff = ray._phase_coeff  # [n_fft] complex, precomputed on ray
+        t_vec = ray.t
+        medium = ray.medium
+        x_list = ray.x
+
+        total = np.zeros(n_t)
+
+        for pair_idx in range(len(xs_ray) // 2):
+            x_entry = xs_ray[2 * pair_idx]
+            x_exit  = xs_ray[2 * pair_idx + 1]
+
+            xi = np.arange(x_entry, x_exit, d_x) + d_x / 2
+            n_pts = xi.size
+            if n_pts == 0:
+                continue
+
+            D_ray = abs(x_exit - x_entry)
+
+            # Window (same logic as original)
+            if window == 'hamming':
+                w = hamming(n_pts)
+            elif window == 'hsphere':
+                w = hamming(n_pts)
+                w *= D_ray / self.size
+            else:
+                w = np.ones(n_pts)
+
+            # Find segment index once for all points in this crossing pair
+            try:
+                seg_idx = next(j for j, v in enumerate(x_list) if v > xi[0]) - 1
+            except StopIteration:
+                logging.error('Unable to get signal for ray: {} at x: {:.3f}'.format(
+                    hash(ray), xi[0]))
+                continue
+
+            # --- Segment-level constants (computed once per crossing pair) ---
+            x0 = x_list[seg_idx]
+            f0 = ray.freq[seg_idx]
+            a0 = ray.a[seg_idx]
+            t0 = ray.int_times[seg_idx]
+            v  = medium.v_ray(ray, seg_idx)
+            xi_over_v = medium.xi / v
+            damping_rate = 2 * np.pi * ray._dom_freq * xi_over_v
+
+            # --- Per-point loop with step-recurrence for phase and damping ---
+            # Each iteration needs exp(phase_coeff * dx_k) — instead of recomputing
+            # n_pts complex exponentials per step, advance by one spatial step via
+            # multiplication:  exp(phase * (dx + d_x)) = exp(phase * dx) * exp(phase * d_x)
+            # This replaces (n_pts - 1) × n_fft complex exp calls with cheap in-place
+            # multiplications (~5–10× faster than exp).
+            dx_k     = xi - x0                                         # [n_pts]
+            mask_idx = np.searchsorted(t_vec, (t0 + dx_k / v) / 2)   # [n_pts]
+            w_dx     = d_x * w                                         # [n_pts]
+
+            step_phase = np.exp(phase_coeff * d_x)                    # [n_fft], once
+            step_amp   = np.exp(-damping_rate * d_x)                  # scalar,  once
+
+            cur_f   = np.exp(phase_coeff * dx_k[0]) * f0              # [n_fft]
+            cur_amp = a0 * np.exp(-damping_rate * dx_k[0])            # scalar
+
+            for k in range(n_pts):
+                s = cur_amp * w_dx[k] * irfft(cur_f, n=n_t)
+                s[:mask_idx[k]] = 0
+                total += s
+                cur_f   *= step_phase   # n_fft complex mults, no exp
+                cur_amp *= step_amp     # 1 scalar mult
+
+        return total
+
+    def signal(self, d_x=0.1, procs=None, window='hsphere'):
+        """ Measure signal at sensor
+        Considers only rays that cut twice
+        :param t: time points
+        :param d_x: integration step
+        :param procs: number of proc for parallel
+        :param window: integration window for ray power function, default 'hsphere'
+        :return: measured signal
+        """
+
+        if not self.int_rays:
+            logging.info('No rays intersecting sensor {}'.format(self.name))
+            return None
+
+        # Time must be equal for all model, its taken from map
+        t = self.map.t
+        signal_mat = np.zeros([len(t), len(self.int_rays)])
+
+        logging.info('Calc signal on sensor {}. Integrating over {} rays'.format(self.name, len(self.int_rays)))
+
+        if (procs is None) or (procs == 1):
+            for i, [rayh, xs_ray] in enumerate(self.int_rays.items()):
+
+                ray = self.map.get_ray(rayh)
+
+                signal_mat[:, i] = self._signal_on_ray(ray, xs_ray, d_x, window)
+
+        else:
+            from multiprocessing import Pool
+            p = Pool(procs)
+
+            results = {}
+            for i, [ray, xs_ray] in enumerate(self.int_rays.items()):
+                args = (ray, xs_ray, d_x, window)
+                results[i] = p.apply_async(self._signal_on_ray, args)
+
+            for i, res in results.items():
+                signal_mat[:, i] = res.get()
+
+        signal = signal_mat.sum(axis=1)
+        self.signal_s = signal * self.sensitivity
+
+        return self.signal_s
+
+    # def
+    
+    def plot(self, ax, color=None, marker=None):
+        for b in self.bounds:
+            b.plot(ax, color, marker)
+
+    def origin(self):
+        """ Returns center of sensor. Only works for circ, for now...
+
+        :return: array shape 2x1
+        """
+        if 'circ' in self.kind:
+            return self.bounds[0].c
+        else:
+            raise NotImplementedError('Method not implemented for sensor fo kind {}'.format(self.kind))
+
+    def add_medium(self, medium):
+        if self.medium is None:
+            self.medium = medium
+        else:
+            raise TypeError('Sensor:{} already has a medium defined.'.format(self))
+
+    def get_limits(self):
+        """
+        Limits of square definition on x and y
+        """
+        xmax, xmin, ymax, ymin = None, None, None, None
+
+        for obj in self.bounds:
+            xmax_o, xmin_o, ymax_o, ymin_o = obj.get_limits()
+            if xmax is None:
+                xmax, xmin, ymax, ymin = xmax_o, xmin_o, ymax_o, ymin_o
+            else:
+                xmax = xmax_o if xmax_o > xmax else xmax
+                xmin = xmin_o if xmin_o < xmin else xmin
+                ymax = ymax_o if ymax_o > ymax else ymax
+                ymin = ymin_o if ymin_o < ymin else ymin
+
+        return xmax, xmin, ymax, ymin

@@ -1,0 +1,196 @@
+    \subsection{Performance Optimization of the Ray Tracing Solver} \label{sec:rt_optimization}
+        The simulation workflow described in Section~\ref{sssec:workflow} must be executed thousands of times to construct the synthetic database used for damage localization by the \acrshort{ai} algorithms of Chapter~\ref{ch::chapter4}. Each entry in the database corresponds to a distinct damage position on the $726 \times 726$~mm \acrshort{cfrp} plate, so the practical feasibility of the database depends critically on the time required to complete a single simulation. The \texttt{RTWave\_SHM} library builds on the ray-tracing framework originally developed by \citeauthor{DF_GLW-08}~\cite{DF_GLW-08}, and its performance optimization constitutes one of the original contributions of this thesis, directly addressing the research gap identified in Section~\ref{sec:ch2-gaps} regarding the prohibitive cost of generating large-scale active \acrshort{glw} datasets.
+        
+        In its initial form, the library relied on pure Python and NumPy/SciPy for all numerical operations.  This choice, described in greater detail below, was appropriate during development because it kept the code readable and modular and because correctness is easier to verify in interpreted Python than in compiled code. However, a single simulation of the specimen scenario with $N = 2001$ rays required approximately \SI{42}{\minute} on the reference hardware, making a full parametric sweep over damage locations entirely impractical. Therefore, a sequence of fourteen targeted code-level modifications was applied, reducing the execution time to \SI{7.56}{\second} (a $334\times$ factor) while preserving the numerical output to within floating-point round-off at every step. A small number of consistency changes that do alter the physical model were introduced after this campaign; they are documented and validated separately in Section~\ref{ssec:opt_consistency}.
+        
+        This section describes each modification in the order in which it was applied, connecting it to the computational structure established in the Appendix~\ref{app:software_implementation}, and explains why the physical output is not affected. The benchmark conditions are held fixed throughout: one source (PZT0), $N = 2001$ rays, a $726 \times 726$~mm plate with a $12 \times 12$~mm square damage region, 10\,000 time samples at a sampling rate of \SI{50}{\mega\hertz}, and $N_{\rm fft} = 500$ frequency bins per ray, \acrfull{fft}. The correctness is monitored at every step by computing the root-mean-square error of the reconstructed A-scan signals (all seven receiving sensors, all time samples) relative to the reference solution, normalised by the root-mean-square value of the reference signals, \acrfull{nrmse}. The reference signals have an RMS value of $1.63\times10^{-2}$ and a peak of $0.32$ (dimensionless units of the model), so an \acrshort{nrmse} of $10^{-14}$ corresponds to an absolute RMSE of $\sim 1.6\times10^{-16}$, i.e.\ the double-precision round-off of the signals themselves. A modification is retained only if the \acrshort{nrmse} stays at this round-off level ($\text{NRMSE} < 10^{-12}$).
+
+
+        \subsubsection{Phase~I: Compilation of Numerical Kernels with Numba}
+        \label{ssec:opt_numba}
+
+            Profiling of the unmodified library identified two modules as responsible for the overwhelming majority of execution time: the geometric intersection routines in \texttt{geom\_utils} and the wavespeed interpolation routines in \texttt{wavespeed}. Both are called at the innermost level of the ray propagation loop, the geometric routines by every \texttt{Segment.intersect} call as described in Section~\ref{sssec:lib_architecture}, and the wave-speed routines by every evaluation of \texttt{medium.v\_ray} and by the construction of the \texttt{fft\_speed} array on each new \texttt{Ray} object (Section~\ref{sssec:conceptual_mapping}). Replacing these routines with JIT-compiled (Just in time) equivalents using the Numba library~\cite{RT_Numba} constitutes Step~1 and delivers the single largest speedup of the entire campaign.
+
+            \paragraph*{Step~1a: Geometry utilities (\texttt{geom\_utils}).}
+            %
+            The segment-segment intersection routine \texttt{seg\_seg\_intersect\_2d}, which is invoked at every boundary interaction in the flat-queue loop of \texttt{Map2D.calc\_t}, originally constructed a $4 \times 3$ homogeneous coordinate matrix, computed two 3-D cross products and four dot products using NumPy array operations, and returned a Python object. Each call therefore allocated at least four temporary arrays and performed multiple Python-level function dispatches. The Numba version replaces the homogeneous-coordinate formulation with the standard parametric $\mathbf{r} \times \mathbf{s}$ segment intersection test, operating entirely on scalar arithmetic within a \texttt{@jit(nopython=True)} function:
+            %
+            \begin{equation}
+                t_{\rm seg} = \frac{(\mathbf{b}_1 - \mathbf{a}_1) \times \mathbf{s}}
+                                   {\mathbf{r} \times \mathbf{s}}, \qquad
+                u_{\rm seg} = \frac{(\mathbf{b}_1 - \mathbf{a}_1) \times \mathbf{r}}
+                                   {\mathbf{r} \times \mathbf{s}},
+                \label{eq:seg_intersect_numba}
+            \end{equation}
+            %
+            where $\mathbf{r} = \mathbf{a}_2 - \mathbf{a}_1$ and $\mathbf{s} = \mathbf{b}_2 - \mathbf{b}_1$ are the two segment direction vectors in 2-D and $\times$ denotes the scalar 2-D cross product. An intersection exists within both segments if and only if $0 \le t_{\rm seg} \le 1$ and $0 \le u_{\rm seg} \le 1$. The circle-segment intersection routine \texttt{circunf\_seg\_intersect\_2d} was analogously rewritten to avoid all temporary array allocations.
+
+            The acceptance test of the original routine was asymmetric: an intersection was accepted only if it lay more than $10^{-3}$~mm \emph{past} the start point of each segment, which is what prevented a freshly reflected ray, whose start point lies exactly on the wall, from intersecting the same wall again. The compiled routine uses instead the symmetric test $-\epsilon \le t_{\rm seg}, u_{\rm seg} \le 1 + \epsilon$ with a distance tolerance of $10^{-9}$~mm. To preserve the self-intersection protection, every reflected or refracted ray is spawned $10^{-8}$~mm away from the wall along its new direction (a factor 10 above the tolerance). This offset displaces ray paths by $10^{-8}$~mm per boundary interaction, i.e.\ a phase change of $\sim 4\times10^{-9}$~rad at \SI{350}{\kilo\hertz}; it was introduced after the table of Section~\ref{ssec:opt_summary} was compiled and is the origin of the residual reported in Section~\ref{ssec:opt_consistency}.
+
+            \paragraph*{Step~1b: Wave-speed interpolation (\texttt{wavespeed}).}
+            %
+            The wave-speed callables \texttt{ws.S0} and \texttt{ws.A0} are evaluated at every \texttt{Ray} construction (to build the $N_{\rm fft}$-element \texttt{fft\_speed} array) and at every call to \texttt{medium.v\_ray} (to obtain the dominant-frequency phase velocity).  As described in Section~\ref{sssec:conceptual_mapping}, for isotropic plates these callables wrap a \texttt{scipy.interpolate.interp1d} object, and for composite laminates they wrap a \texttt{RegularGridInterpolator}. Both carry SciPy's general-purpose infrastructure overhead (input validation, type dispatch, and attribute lookups) on every call.
+
+            The SciPy interpolants were replaced by two custom Numba kernels: \texttt{interp1d\allowbreak\_numba}, which wraps \texttt{np.interp} (supported in Numba's nopython mode) for the 1-D isotropic case, and \texttt{interp2d\_regular\_numba}, a hand-written bilinear interpolation routine for the composite 2-D case.  The bilinear kernel performs index search via \texttt{np.searchsorted}, boundary handling, and bilinear weighting in a single compiled function, executing entirely in native code without any Python dispatch overhead. Outside the tabulated range the cell index is clamped to the last cell while the interpolation weights are not, so the kernel extrapolates linearly; this is relied upon by the thicker damage medium ($h = 3$~mm), whose frequency--thickness products reach \SI{7.5}{\mega\hertz\milli\metre}, above the \SI{3.5}{\mega\hertz\milli\metre} (S0) and \SI{4.8}{\mega\hertz\milli\metre} (A0) limits of the dispersion tables.
+
+            Together, Steps~1a and 1b reduced the execution time from \SI{2525}{\second} to \SI{231}{\second}, a speedup of $10.9\times$.
+
+
+        \subsubsection{Phase~II: Algorithmic and Data-Flow Optimizations}
+        \label{ssec:opt_algo}
+
+            With the numerical kernels compiled, profiling of the accelerated code revealed several Python-level bottlenecks in the orchestration and state management layers described in Sections~\ref{sssec:lib_architecture} and~\ref{sssec:conceptual_mapping}.  Seven modifications were applied in this phase.
+
+            \paragraph*{Step~2: In-memory ray cache in \texttt{Map2D}.}
+            %
+            In the original implementation, \texttt{Map2D.save\_ray} and \texttt{Map2D.get\_ray} serialized and deserialized ray state to and from an HDF5 file at \emph{every propagation step} of \texttt{calc\_t}. With thousands of rays in the flat queue, each HDF5 read triggered a disk seek, a dataset lookup by string key, and a numpy array copy. A Python dictionary \texttt{ray\_cache} was introduced as a primary in-memory store: rays are inserted into the cache at creation time by \texttt{save\_ray} and retrieved in $\mathcal{O}(1)$ by integer hash lookup in \texttt{get\_ray}. HDF5 disk writes are deferred to the explicit call \texttt{flush\_rays\_to\_h5}, invoked once at the end of the simulation for persistence.  This change reduces every inter-step ray access from a disk I/O operation to a dictionary lookup keyed by the cached hash \texttt{\_hash} described in Section~\ref{sssec:conceptual_mapping}. Speedup: $2.0\times$.
+
+            \paragraph*{Step~3: Zero-amplitude ray culling in \texttt{ray\_utils}.}
+            %
+            At every boundary interaction, \texttt{ray\_refl} and \texttt{ray\_refr} spawn up to four daughter rays (Section~\ref{sssec:lib_architecture}). With small values of \texttt{ratio\_rfl} and \texttt{ratio\_mode}, the amplitude of certain daughter rays falls below the tolerance threshold $a_{\rm tol} = 10^{-8}$ at birth.  In the original code, these zero-energy rays were nevertheless allocated as \texttt{Ray} objects, their $N_{\rm fft}$-element \texttt{fft\_speed} array was computed, and they were inserted into the queue only to be immediately discarded as dead at the next call to \texttt{alive\_ray}.  Early amplitude guards were inserted in \texttt{ray\_refl} and \texttt{ray\_refr} to completely skip spawning when the computed daughter amplitude fell below $a_{\rm tol}$. Since the removed rays carry no energy, the A-scan output is unaffected. Speedup: $2.2\times$.
+
+            \paragraph*{Step~4: Cached hash in \texttt{Ray}.}
+            %
+            The method \texttt{Ray.\_\_hash\_\_} was called at every \texttt{save\_ray}, \texttt{get\_ray}, and dictionary-key operation. In the original code, a composite hash was recomputed from floating-point array tuples on every invocation. As explained in Section~\ref{sssec:conceptual_mapping}, the hash encodes only the immutable initial state of the ray (origin, direction, spawn time, spectral content), so it is constant over the ray's lifetime. It was therefore computed once in \texttt{\_\_init\_\_} and stored in the \texttt{\_hash} slot of the \texttt{\_\_slots\_\_} declaration. Speedup: $1.06\times$.
+
+            \paragraph*{Step~5: Lazy \texttt{fft\_speed} for dead rays.}
+            %
+            When \texttt{load\_ray} reconstructed a ray from HDF5, it always triggered the $N_{\rm fft}$-element \texttt{fft\_speed} computation, even for rays whose amplitude was zero (``dead rays'').  A guard was added to skip this computation when $a = 0$, since dead rays are never propagated further and their wave-speed array is never accessed. Speedup: $1.01\times$.
+
+            \paragraph*{Step~6: Vectorized \texttt{fft\_speed} construction in \texttt{Ray.\_\_init\_\_}.}
+            %
+            As described in Section~\ref{sssec:conceptual_mapping}, each \texttt{Ray} builds the array $\mathbf{v}_p$ of $N_{\rm fft}$ phase velocities at construction time. In the original code this was done via a Python \texttt{for} loop that called the wave-speed callable once per frequency bin, re-evaluating \texttt{np.arctan2}, \texttt{getattr}, and the modulo operation identically at every iteration. These loop-invariant expressions were lifted out of the loop, and the wave-speed function reference was resolved once before entering the loop. With $N_{\rm fft} = 500$ and $2N = 4002$ initial rays, this eliminated over two million redundant Python-level operations per simulation.  Speedup: $2.1\times$.
+
+            \paragraph*{Step~7: Invariant hoisting in \texttt{Sensor.\_signal\_on\_ray}.}
+            %
+            The sensor signal reconstruction method \texttt{Sensor.\_signal\_on\_ray}, which implements the chord integration described in Section~\ref{sssec:lib_architecture}, recomputed several ray-level and segment-level constants at every integration point $x_k$: the phase velocity, the damping rate, the dominant frequency bin index, and the $N_{\rm fft}$-element phase-rate array. These were hoisted to the appropriate outer scope, once per ray for the velocity and damping rate, once per entry--exit pair for the chord length, reducing the innermost loop to a single call to \texttt{signal\_at\_x} and an array multiply. Speedup: $1.04\times$.
+
+            \paragraph*{Step~8: Garbage-collection control and \texttt{medium} caching.}
+            %
+            The rapid creation and abandonment of temporary NumPy arrays during the flat-queue loop triggered CPython's cyclic garbage collector at high frequency, introducing non-deterministic pauses. The collector was disabled with \texttt{gc.disable()} at the start of \texttt{calc\_t} and re-enabled with a single \texttt{gc.collect()} call after the loop, as visible in the final version of \texttt{Map2D} (Section~\ref{sssec:lib_architecture}).
+
+            Additionally, the two most expensive attribute lookups in the \texttt{medium.v\_ray} hot path, the thickness-to-frequency conversion factor and the wave-speed function reference, were pre-cached at \texttt{medium} construction time as \texttt{\_th\_factor}$= h/10^6$ and \texttt{\_ws\_func}$= \{\text{`S0'}: \texttt{ws.S0}, \text{`A0'}: \texttt{ws.A0}\}$.  Combined with the change in garbage-collection, this step contributes to a $1.01\times$ increase.
+
+            \paragraph*{Step~9 (reverted): Coarser sensor integration step.}
+            %
+            Increasing the chord integration step from $d_x = 0.1$~mm to $d_x = 0.5$~mm was tested to reduce the number of integration points in \texttt{Sensor.\_signal\_on\_ray}.  Although this produced an $11\%$ speedup, it introduced a \acrshort{nrmse} of $6.8 \times 10^{-4}$ in the reconstructed A-scans caused by under-sampling short oblique ray crossings through the sensor aperture. This modification was therefore reverted. The result confirms that the integration step $d_x = 0.1$~mm is a genuine accuracy requirement of the area-sensor model discussed in Section~\ref{sssec:approximations}.
+
+
+        \subsubsection{Phase~III: Redundant-Computation Elimination}
+        \label{ssec:opt_redundant}
+
+            The third phase targeted computations that were physically constant over a ray's lifetime but were nonetheless recomputed at every propagation step. These invariants are direct consequences of the theoretical model: because the phase velocity $v_p(\omega,\vartheta)$ depends on frequency and direction but not on position, and because the dispersive phase coefficient $\boldsymbol{\alpha}$ of equation~(\ref{eq:phase_coeff}) is determined entirely by the initial direction and the medium, both quantities are fixed at ray creation and can be stored as read-only attributes.
+
+            \paragraph*{Step~10: Cached dominant-frequency index in \texttt{Ray}.}
+            %
+            The dominant \acrshort{fft} bin index, used to select the representative phase velocity for the calculation of travel-time in \texttt{calc\_ray} and the second amplitude decay in \texttt{medium.tl}, was originally evaluated as \texttt{np.argmax(np.abs(freq))} in every invocation. Because the dispersive phase shift of equation~(\ref{eq:dispersion}) rotates the complex phase of each frequency component without altering its magnitude, the index of the dominant bin is invariant over the ray's entire lifetime It is now computed once in \texttt{\_\_init\_\_} and stored a \texttt{\_dom\_freq\_idx} and \texttt{\_dom\_freq}, as described in Section~\ref{sssec:conceptual_mapping}.  Speedup: $1.004\times$.
+
+            \paragraph*{Step~11: Pre-stored dispersion phase coefficient in \texttt{Ray}.}
+            %
+            Every call to \texttt{medium.fshift\_dispersion}, invoked at each propagation step to apply equation~(\ref{eq:dispersion}), originally recomputed the coefficient $\boldsymbol{\alpha} = -i 2\pi\mathbf{f}/ \mathbf{v}_p$, a 500-element array division. Since $\mathbf{v}_p$ is assembled at construction time and never changes, $\boldsymbol{\alpha}$ is also invariant. Pre-computing it as \texttt{\_phase\_coeff} in \texttt{Ray.\_\_init\_\_}, as described in Section~\ref{sssec:conceptual_mapping} and equation~(\ref{eq:phase_coeff}), replaces every subsequent \texttt{fshift} call with a single element-wise multiply \texttt{np.exp(\_phase\_coeff * x) * f}.  Speedup: $1.02\times$.
+
+            \paragraph*{Step~12: Batched 2-D interpolation in \texttt{wavespeed\_composite}.}
+            %
+            Even with the Numba kernel from Step~1b, the construction of \texttt{fft\_speed} still called \texttt{interp2d\_regular\_numba} once per frequency bin, 500 separate Python$\to$Numba dispatches per ray, each redundantly recomputing the $y$-direction index and weight for the fixed propagation angle $\vartheta$. A new kernel, \texttt{interp2d\_batch\_fixed\_y}, was written to accept the full frequency array at a fixed $\vartheta$, compute the $y$-index and weight once, and loop over all 500 frequency values entirely in the compiled code. This kernel is exposed through the \texttt{wavespeed\_composite.batch\_speed} method, which is invoked in \texttt{Ray.\_\_init\_\_} when the wave-speed object supports it (Section~\ref{sssec:conceptual_mapping}). The result is that 500 Python-level function calls are replaced by a single dispatch per ray. Speedup: $2.1\times$.
+
+            \paragraph*{Step~13: Shared \acrshort{fft} frequency array across \texttt{Beam} and \texttt{Ray}.}
+            %
+            Every \texttt{Ray} instance originally computed its own \acrshort{fft} frequency array via \texttt{scipy.fft.rfftfreq}, despite all rays in a simulation (initial rays, reflected rays, refracted rays) sharing the same time vector $\mathbf{t}$ and \acrshort{fft} length. As described in Section~\ref{sssec:lib_architecture}, the array is now computed once in the \texttt{Beam} constructor and propagated by reference to all child \texttt{Ray} objects through the keyword argument \texttt{\_fft\_freq}. Daughter rays spawned at boundary interactions inherit the same reference, so the array is created exactly once per simulation, regardless of how many rays the tree eventually contains.  Speedup: $1.15\times$.
+
+
+            \paragraph*{Step~14: Step-recurrence for dispersive phase and amplitude in \texttt{\_signal\_\allowbreak on\_ray}.}
+            %
+            The innermost loop of \texttt{Sensor.\_signal\_on\_ray} iterates over $n_\mathrm{pts} = D_\mathrm{ray}/\Delta x$ uniformly-spaced integration points inside each sensor crossing chord. At integration point~$k$, the dispersed spectrum passed to the \acrfull{ifft} is
+            \begin{equation}
+              \mathbf{F}_k = \mathbf{f}_0
+                \cdot\exp\!\bigl(\boldsymbol{\alpha}\,\delta x_k\bigr),
+              \qquad \delta x_k = \xi_k - x_0,
+              \label{eq:Fk}
+            \end{equation}
+            where $\boldsymbol{\alpha}$ is the cached phase-coefficient vector (Step~11) and $x_0$ is the last recorded ray-segment origin. Each spectrum sample is scaled by a real-valued amplitude factor $a_k$, which accounts for both the cumulative energy losses accumulated along the ray up to the current segment and the within-segment material damping. Specifically, $a_k = a_0\exp(-\gamma\,\delta x_k)$, where $a_0 = \texttt{ray.a[seg\_idx]}$ encodes all prior geometric spreading and boundary reflection/transmission losses, and the exponential term accounts solely for within-segment material damping at rate $\gamma = 2\pi f_\mathrm{dom}\,\xi_\mathrm{med}/v$, with $\xi_\mathrm{med}$ the damping coefficient of the current medium (\texttt{medium.xi}) and $v$ the wave speed at that segment. The original implementation recomputed both transcendental functions from scratch at every iteration, requiring $n_\mathrm{pts}$ evaluations of the exponential 500-element complex $\exp(\boldsymbol{\alpha}\,\delta x_k)$.
+            Because the integration grid is uniform with spacing $\Delta x$, the spatial offsets satisfy $\delta x_k = \delta x_0 + k\,\Delta x$, so equation~(\ref{eq:Fk}) factors into a geometric recurrence:
+            \begin{equation}
+              \mathbf{F}_k
+                = \mathbf{F}_{k-1}
+                  \cdot \underbrace{\exp(\boldsymbol{\alpha}\,\Delta x)}_{\mathbf{p}_\Delta},
+              \qquad
+              a_k = a_{k-1}
+                  \cdot \underbrace{\exp(-\gamma\,\Delta x)}_{s_\Delta}.
+              \label{eq:step_recurrence}
+            \end{equation}
+            The two \emph{step constants} $\mathbf{p}_\Delta$ and $s_\Delta$ (a 500-element complex array and a scalar, respectively) are evaluated once before the loop. Each subsequent iteration advances the running spectrum and amplitude by in-place element-wise multiplications, which completely replace the transcendental function evaluation. For a typical sensor of diameter $2r_\mathrm{PZT} = 8$\,mm with integration step $\Delta x = 0.1$\,mm, this reduces $n_\mathrm{pts} = 80$ complex-exponential-array evaluations to a single evaluation at $k = 0$ followed by 79 in-place multiplications, a reduction of approximately $5$-$10\times$ in the non-\acrshort{ifft} cost of the loop. The recurrence accumulates one rounding error per multiplication, which raises the \acrshort{nrmse} from $1.3\times10^{-14}$ to $1.9\times10^{-13}$, still at round-off level. Speedup: $1.16\times$ ($8.80\,\text{s} \to 7.56\,\text{s}$).
+
+        \subsubsection{Summary of Results}
+        \label{ssec:opt_summary}
+
+            Table~\ref{tab:opt_results} summarizes the execution time, incremental speedup, cumulative speedup relative to the original implementation, and signal error after each optimization step. Figure~\ref{fig:opt_evolution} presents the performance evolution graphically.
+
+            The total speedup achieved is $334\times$ relative to the original pure-Python implementation, or equivalently $30.6\times$ relative to the Numba-compiled baseline (Step~1).  All retained optimizations preserve the output signals to within floating-point round-off (\acrshort{nrmse} $< 2 \times 10^{-13}$, i.e.\ absolute RMSE $< 3.1\times10^{-15}$).  The three phases contribute factors of $10.9\times$, $10.7\times$, and $2.9\times$ respectively, reflecting a systematic progression from the largest single gain (replacing Python interpretation with native code) to increasingly fine-grained elimination of redundant work within the compiled environment.
+
+            The final execution time of \SI{7.56}{\second} per simulation enables a complete parametric sweep over a spatial grid of damage locations to be completed in hours on a single workstation, making the construction of the synthetic database for Chapter~\ref{ch::chapter4} computationally feasible.
+
+            \begin{table}[htbp]
+                \centering
+                \caption{Performance evolution of the ray tracing solver. ``Incr.'' denotes the speedup relative to the previous accepted step; ``Cumul.'' is relative to the original implementation (Step~0).}
+                \label{tab:opt_results}
+                \sisetup{
+                    round-mode=places,
+                    table-format=4.1,
+                    group-separator={,},
+                }
+                \small
+                \begin{tabular}{@{}clS[table-format=4.2]S[table-format=2.2]S[table-format=3.1]c@{}}
+                    \toprule
+                    {Step} & {Optimization} & {Time (\si{\second})} & {Incr.\ ($\times$)} & {Cumul.\ ($\times$)} & {NRMSE} \\
+                    \midrule
+                    0  & Original (pure Python)            & 2525.09 & {---}  & 1.0    & {---} \\
+                    1  & Numba compilation                 & 231.36  & 10.91  & 10.9   & $1.1\times10^{-14}$ \\
+                    2  & In-memory ray cache               & 115.19  & 2.01   & 21.9   & $1.1\times10^{-14}$ \\
+                    3  & Zero-amplitude culling            & 51.43   & 2.24   & 49.1   & $1.1\times10^{-14}$ \\
+                    4  & Hash caching                      & 48.62   & 1.06   & 51.9   & $1.1\times10^{-14}$ \\
+                    5  & Lazy \texttt{fft\_speed} (dead rays) & 48.11 & 1.01  & 52.5   & $1.1\times10^{-14}$ \\
+                    6  & Vectorised \texttt{fft\_speed}    & 22.80   & 2.11   & 110.7  & $1.1\times10^{-14}$ \\
+                    7  & Signal integration hoisting       & 21.85   & 1.04   & 115.6  & $1.2\times10^{-14}$ \\
+                    8  & GC control \& medium caching      & 21.58   & 1.01   & 117.0  & $1.2\times10^{-14}$ \\
+                    9  & Coarser integration step          & 19.47   & 1.11   & {---}  & $4.2\times10^{-2}$\textsuperscript{$\dagger$} \\
+                    10 & Cached dominant frequency         & 21.50   & 1.004  & 117.4  & $1.2\times10^{-14}$ \\
+                    11 & Pre-stored phase coefficient      & 21.16   & 1.02   & 119.4  & $1.2\times10^{-14}$ \\
+                    12 & Batched 2-D interpolation         & 10.16   & 2.08   & 248.6  & $1.3\times10^{-14}$ \\
+                    13 & Shared FFT frequency array        & 8.80    & 1.15   & 286.9  & $1.3\times10^{-14}$ \\
+                    14 & Step-recurrence                   & 7.56    & 1.16   & 334.0  & $1.9\times10^{-13}$\textsuperscript{$\ddagger$} \\
+                    \bottomrule
+                \end{tabular}
+
+                \medskip
+                {\footnotesize \textsuperscript{$\dagger$}Step~9 was reverted;
+                subsequent steps build upon Step~8. Its error (4.2\,\%) is caused by
+                under-sampling of short oblique chords through the sensor aperture.\\
+                \textsuperscript{$\ddagger$}Round-off accumulation of the multiplicative
+                recurrence (one rounding per integration point); the value is derived
+                from the absolute RMSE of the run ($3.0\times10^{-15}$), whose result file
+                was not retained.\\
+                NRMSE is the RMSE over all receiving sensors and time samples divided by
+                the RMS value of the reference signals ($1.63\times10^{-2}$).}
+            \end{table}
+
+
+        \subsubsection{Consistency Changes and Final Validation}
+        \label{ssec:opt_consistency}
+
+            The fourteen steps above are pure re-implementations: each preserves the physical model of the original solver. After the campaign, a review of the resulting code identified three further changes that had been introduced without being recorded in Table~\ref{tab:opt_results}, one of which was internally inconsistent. They are documented here together with their effect on the output, and the final solver is validated against the original one in a single end-to-end comparison.
+
+            \paragraph*{Source normalisation.}
+            %
+            In the original implementation the excitation burst was scaled by the per-ray power $a_0 = P/(2N)$ and every ray again carried the amplitude $a_0$, so the reconstructed signals scaled as $a_0^2$. The burst is now generated with unit amplitude and the signals scale linearly with $a_0$, which makes the sensor output proportional to the injected power $P$, as intended. For the database of Chapter~\ref{ch::chapter4} the source power is set to $P = N/8$, so the signals are $16\times$ larger than those of the original normalisation. This is a pure rescaling and is retained deliberately.
+
+            \paragraph*{Direction-dependent dispersion after reflection.}
+            %
+            The original solver evaluated the phase-velocity array $\mathbf{v}_p$ of a ray once, for its birth direction, and kept it for the ray's entire life, including after reflections. The travel time of each segment and the mode-converted rays spawned at boundaries did use the actual propagation direction, so for the anisotropic laminate the same-mode reflected ray was dispersed with the curve of the wrong angle. In the final solver $\mathbf{v}_p$ and the phase coefficient $\boldsymbol{\alpha}$ of Step~11 are recomputed after every reflection for the new direction (module switch \texttt{dispersion\_follows\_direction}, enabled by default; disabling it recovers the original behaviour). The dispersion tables of the $(+45, -45, 90, 0)$ laminate are not mirror-symmetric, $v_p(\vartheta) \neq v_p(\pi - \vartheta)$ by up to $0.7\,\%$ for S0 and $1.5\,\%$ for A0, so every specular reflection at the plate edges changes the curve. Because $\boldsymbol{\alpha}$ is then no longer constant along a ray, the chord integration of \texttt{Sensor.\_signal\_on\_ray} was made consistent with the tracing: each integration point now uses the coefficient of the direction of the ray segment it lies in (\texttt{Ray.phase\_coeff\_at}). The first implementation had applied the coefficient of the \emph{last} segment to every segment, including the direct source--sensor path of any ray that later reached a plate edge.
+
+            \paragraph*{Sensor integration and sensor placement.}
+            %
+            Step~7 had also replaced the per-point segment lookup of the original chord integration by a single lookup per chord. The per-point semantics were restored: a chord that spans a boundary event is split into runs of points on the same segment, points beyond the last recorded ray position are discarded (as in the original), and the step recurrence of Step~14 is restarted for every run. A sensor must lie entirely inside one medium; a relaxed placement rule that accepted a sensor cut by a medium boundary was reverted, since such a sensor would only record the rays of one of the two media.
+
+            \paragraph*{End-to-end validation.}
+            %
+            The final solver was compared with the original implementation (with the same unit-amplitude burst) on the benchmark case of Table~\ref{tab:opt_results} ($N = 2001$, 10\,000 samples, $N_{\rm fft} = 500$). With \texttt{dispersion\_follows\_direction} disabled, i.e.\ with the physics of the original solver, the \acrshort{nrmse} over all sensors is $5.0\times10^{-9}$ (absolute RMSE $8.2\times10^{-11}$), and $3\times10^{-12}$ in the direct-arrival window (20--\SI{50}{\micro\second}) of the nearest sensor, which contains no reflected rays. The residual is fully accounted for by the $10^{-8}$~mm boundary offset introduced with Step~1a ($\sim 4\times10^{-9}$~rad of phase per reflection), which was not yet present when Table~\ref{tab:opt_results} was compiled. With the direction-dependent dispersion enabled the \acrshort{nrmse} rises to $0.15$, entirely due to the reflected arrivals: the direct-arrival windows of the two sensors closest to the source change by $2.3\times10^{-4}$ and $2.4\times10^{-3}$ only. On the workstation used for this validation the original implementation with compiled wave-speed tables (Python geometry, on-disk ray store) required \SI{166.5}{\second} and the final solver \SI{2.4}{\second} (\SI{1.55}{\second} tracing, \SI{0.86}{\second} signal reconstruction) for the same case. The comparison script (\texttt{tests/compare\_v1\_v2.py}) and a unit test of the chord integration semantics (\texttt{tests/test\_signal\_on\_ray.py}) are distributed with the library.

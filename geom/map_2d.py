@@ -5,7 +5,7 @@ import numpy as np
 from tqdm import tqdm
 import h5py
 
-import RayTracing.Sensors
+import RayTracing.Sensors as rt_sensor
 from geom import objects_2d
 from utils_rays.ray_utils import split_ray, load_ray, save_ray
 import gc
@@ -16,11 +16,12 @@ class Map2D:
 
         self.background=background
 
-        if h5_fname is None:
-            from tempfile import SpooledTemporaryFile
-            h5_fname = SpooledTemporaryFile()
-        # File is opened in init
-        self.h5file = h5py.File(h5_fname, 'a')
+        # --- In-memory ray cache (primary store during simulation) ---
+        self.ray_cache = {}
+
+        # --- HDF5 file: lazy-initialized, used only for persistence ---
+        self._h5_fname = h5_fname
+        self._h5file = None
 
         self.mediums = {m.__hash__(): m for m in mediums}
         self.sensors = []
@@ -29,7 +30,7 @@ class Map2D:
             for o in m.objs:
                 if hasattr(o, 'map'):
                     o.map = self  # store reference to self on objects that may need it
-                if isinstance(o, RayTracing.Sensors.Sensor):
+                if isinstance(o, rt_sensor.Sensor):
                     self.sensors.append(o)
         # self.t_solved = 0.
 
@@ -52,19 +53,23 @@ class Map2D:
     def calc_t(self, t=None, procs=None):
         t = self.t.max() if t is None else t
 
-        # if t <= self.t_solved:
-        #    return
-        # import numpy as np
-        # incs = np.linspace(self.t_solved, t, nincs+1)[1:]
-
         # o_rays = [r for r in self.rays]  # copy the original rays to propagate
         # Propagate all rays a time t
         if (procs is None) or (procs == 1):
             logging.info('Solving trace up to {:.3E} s for {} rays'.format(t, len(self.rays_h)))
-            for i in tqdm(range(len(self.rays_h)), disable=self.background):
-                ray = self.get_ray(self.rays_h[i])
-                rays_r = self.trace_ray(ray, t)  # returns hashes
-                self.rays_h += rays_r  # new rays are appended always at the end
+
+            # Disable GC during the hot loop — avoid scanning the growing ray cache
+            gc_was_enabled = gc.isenabled()
+            gc.disable()
+            try:
+                for i in tqdm(range(len(self.rays_h)), disable=self.background):
+                    ray = self.get_ray(self.rays_h[i])
+                    rays_r = self.trace_ray(ray, t)  # returns hashes
+                    self.rays_h += rays_r  # new rays are appended always at the end
+            finally:
+                if gc_was_enabled:
+                    gc.enable()
+                gc.collect()  # single collection after all tracing is done
 
         else:
             raise NotImplementedError
@@ -87,7 +92,6 @@ class Map2D:
         """ Traces a ray included in map
         """
         rays_r = ray.trace(t, self)  # returns hashes
-        gc.collect()
         return rays_r
 
     def calc_iter(self, N, t=None, procs=None):
@@ -287,22 +291,51 @@ class Map2D:
             vtk.write('# vtk DataFile Version {}'.format(version))
             vtk.write('')
 
-    def close_h5(self):
-        """ Closes hdf5 file """
-        self.h5file.close()
+    # --- HDF5 lazy property ---------------------------------------------------
+    @property
+    def h5file(self):
+        """Lazy-open: the HDF5 file is created only when actually needed."""
+        if self._h5file is None:
+            if self._h5_fname is None:
+                from tempfile import SpooledTemporaryFile
+                self._h5_fname = SpooledTemporaryFile()
+            self._h5file = h5py.File(self._h5_fname, 'a')
+        return self._h5file
 
+    # --- Ray store (in-memory cache with HDF5 fallback) --------------------
     def get_ray(self, ray_h):
-        return load_ray(ray_h, self.h5file, self)
+        """Retrieve a ray: cache first, then HDF5 fallback."""
+        ray = self.ray_cache.get(ray_h)
+        if ray is not None:
+            return ray
+        # Fallback: load from HDF5 (legacy files / checkpoints)
+        ray = load_ray(ray_h, self.h5file, self)
+        self.ray_cache[ray_h] = ray
+        return ray
 
     def save_ray(self, ray):
-        save_ray(ray, self.h5file)
+        """Store ray in the in-memory cache (no disk I/O)."""
+        self.ray_cache[ray.__hash__()] = ray
 
-    def save_signals(self, fname, key='', format='hdf', use_pandas=False):
+    def flush_rays_to_h5(self):
+        """Persist all cached rays to the HDF5 file."""
+        logging.info('Flushing {} rays to HDF5'.format(len(self.ray_cache)))
+        for ray in self.ray_cache.values():
+            save_ray(ray, self.h5file)
+
+    def close_h5(self):
+        """Closes HDF5 file (if it was ever opened)."""
+        if self._h5file is not None:
+            self._h5file.close()
+            self._h5file = None
+
+    def save_signals(self, fname, key='', format='hdf', use_pandas=False, bits_32=False):
         """
         Saves the sensors signals on a file
         :param fname: Filename
         :param key: HDF file name path
         :param format: only hdf supported
+        :param bits_32: if True, cast data to float32 before saving (halves file size)
         :return:
         """
 
@@ -316,6 +349,8 @@ class Map2D:
                 sensors_s.append(s.signal_s)
                 sensors_l.append(s.name)
         sensors_s = np.array(sensors_s).T
+        if bits_32:
+            sensors_s = sensors_s.astype(np.float32)
 
         if use_pandas:
             import pandas as pd
@@ -332,19 +367,24 @@ class Map2D:
                     h5f[key].attrs['columns'] = sensors_l
 
     def add_sensor(self, sens):
+        """Register a sensor in the first medium whose bounding box fully contains it.
+
+        Full containment is required: a sensor cut by a medium boundary would
+        only see the rays of the medium it is registered in, and its
+        integration chords would extend past the point where those rays are
+        truncated at the boundary.
+        """
         xmax_s, xmin_s, ymax_s, ymin_s = sens.get_limits()
 
         for i, m in self.mediums.items():
             xmax_m, xmin_m, ymax_m, ymin_m = m.get_limits()
-            # x
-            if xmax_m > xmax_s:
-                if xmin_m < xmin_s:
-                    if ymax_m > ymax_s:
-                        if ymin_m < ymin_s:
-                            # The sensor is only added to the first medium that matches
-                            m.add_objs([sens, ])
-                            if hasattr(sens, 'map'):
-                                sens.map = self
-                            self.sensors.append(sens)
-                            return
-        raise KeyError('Unable to add sensor: {}'.format(sens))
+            if xmax_m > xmax_s and xmin_m < xmin_s and ymax_m > ymax_s and ymin_m < ymin_s:
+                # The sensor is only added to the first medium that matches
+                m.add_objs([sens, ])
+                if hasattr(sens, 'map'):
+                    sens.map = self
+                self.sensors.append(sens)
+                return
+        raise KeyError('Unable to add sensor {}: bounding box x=[{:.2f}, {:.2f}], '
+                       'y=[{:.2f}, {:.2f}] is not fully inside any medium'.format(
+                           getattr(sens, 'name', sens), xmin_s, xmax_s, ymin_s, ymax_s))
