@@ -339,7 +339,32 @@ def make_video(z_frames: np.ndarray, t: np.ndarray,
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+NFFT = 500
+MESH = 'holes'      # gen_MUSE_dmg mesh: 'holes' (default) or legacy 'cells'
+
+
+def _video_name() -> str:
+    if UNDAMAGED:
+        return os.path.join(_VIDEO_DIR, 'Intact.mp4')
+    if DMG_SHAPE == 'ellipse':
+        base = f'E-{XLDMG}x{YLDMG}_A-{np.degrees(PHIDMG):.0f}_X-{XDMG}_Y-{YDMG}'
+    else:
+        base = f'D-{XLDMG}_X-{XDMG}_Y-{YDMG}'
+    return os.path.join(_VIDEO_DIR, f'{base}_{MESH}_nfft{NFFT}.mp4')
+
+
 if __name__ == '__main__':
+    import argparse
+    ap = argparse.ArgumentParser(description='MUSE wavefield video')
+    ap.add_argument('--shape', choices=['rect', 'ellipse'], default=DMG_SHAPE)
+    ap.add_argument('--nfft', type=int, default=NFFT)
+    ap.add_argument('--mesh', choices=['holes', 'cells'], default=MESH)
+    ap.add_argument('--intact', action='store_true')
+    ap.add_argument('--out', default=None, help='output file (default: derived from the parameters)')
+    _a = ap.parse_args()
+    DMG_SHAPE, NFFT, MESH = _a.shape, _a.nfft, _a.mesh
+    UNDAMAGED = UNDAMAGED or _a.intact
+    OUTPUT = _a.out or _video_name()
 
     # 1 — Build geometry
     print('Building geometry...')
@@ -349,14 +374,14 @@ if __name__ == '__main__':
         m, pzts = gen_MUSE_dmg(
             xdmg=XDMG, ydmg=YDMG, xldmg=XLDMG, yldmg=YLDMG,
             thdmg=THDMG, rdmg=RDMG, bldmg=BLDMG, rmdmg=RMDMG,
-            shape=DMG_SHAPE, phidmg=PHIDMG,
+            shape=DMG_SHAPE, phidmg=PHIDMG, mesh=MESH,
         )
 
     # 2 — Initial beam  (both S0 and A0)
     print(f'Emitting beam from PZT{SOURCE_IDX + 1} ({NRAYS} rays, S0+A0)...')
     ibeam = Beam_from_pzt(
         NRAYS, pzts[SOURCE_IDX], power=2001 / 8,
-        f=F, npeaks=3, nfft=500, t=T,
+        f=F, npeaks=3, nfft=NFFT, t=T,
     )
     m.set_init_beam(ibeam)
 
