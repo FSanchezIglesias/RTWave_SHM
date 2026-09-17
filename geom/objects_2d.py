@@ -1,8 +1,11 @@
 import numpy as np
 
 # import math
-from geom.geom_utils import seg_seg_intersect_2d, norm_2d, cross_2d
+from geom.geom_utils import (seg_seg_intersect_2d, norm_2d, cross_2d, _seg_seg_intersect_2d_numba,
+                             _ellipse_seg_intersect_2d_numba, wrap_angle_pi)
 from utils_rays.ray_utils import ray_refl, ray_refr
+
+_SEG_TOL = 1.e-9  # distance tolerance [mm] of the segment-segment intersection test
 
 
 # class Plane:
@@ -80,7 +83,7 @@ class medium:
             fi = ray._dom_freq
         f_d = fi * self._th_factor
         theta = np.arctan2(ray.d[i][1], ray.d[i][0]) + self.theta
-        theta = theta % np.pi  # angles defined between [0, pi)
+        theta = wrap_angle_pi(theta)
 
         return self._ws_func[ray.kind]((f_d, theta)) * 1.E3
     
@@ -139,6 +142,41 @@ class medium:
         return xmax, xmin, ymax, ymin
 
 
+def _interact(obj, ray, n, d, intersect, t, map):
+    """Reflect/refract ``ray`` at the boundary ``obj`` hit at ``intersect``.
+
+    Shared by every boundary primitive that rays interact with (``Segment``,
+    ``Ellipse``).  ``obj`` must expose ``mediums``, ``ratio_rfl``,
+    ``ratio_mode`` and ``bl``.  ``n`` is the unit normal pointing away from
+    the side the ray comes from and ``d`` a unit tangent.
+
+    :return: hashes of the new rays spawned at the boundary
+    """
+    irays = []
+
+    # estimate intersc. time
+    t_int = norm_2d(intersect-ray.trace_points[-2]) / norm_2d(ray.trace_points[-1]-ray.trace_points[-2]) \
+            * (t-ray.int_times[-2]) + ray.int_times[-2]
+
+    # Reflect ray
+    irays_rfl, ray_params_i = ray_refl(ray, n, d, intersect, t_int, t,
+                                       ratio=obj.ratio_rfl, ratio_mode=obj.ratio_mode,
+                                       bl=obj.bl, map=map)
+    irays.extend(irays_rfl)
+
+    # Refract ray on all remaining boundaries
+    if len(obj.mediums) > 1:
+        x_i, trace_i, d_i, f_i, a_i, t_i = ray_params_i
+        ratio_rfr = (1 - obj.ratio_rfl) / (len(obj.mediums) - 1)
+        for m2 in obj.mediums:
+            if not m2 == ray.medium:
+                irays.extend(ray_refr(ray, n, d, intersect, t_int, t, d_i, a_i, f_i,
+                                      ratio=ratio_rfr, m2=m2, ratio_mode=obj.ratio_mode,
+                                      bl=obj.bl, map=map))
+
+    return irays
+
+
 class Segment:
     def __init__(self, a1, a2, boundary_losses=0.2,
                  color='black',
@@ -147,7 +185,10 @@ class Segment:
 
         self.a1 = a1
         self.a2 = a2
-        
+        # contiguous float64 copies for direct calls into the Numba kernels
+        self._a1 = np.ascontiguousarray(a1, dtype=np.float64)
+        self._a2 = np.ascontiguousarray(a2, dtype=np.float64)
+
         self.d = (a2-a1)/norm_2d(a2-a1)
         self.n = np.array([self.d[1], -self.d[0]])
 
@@ -175,70 +216,48 @@ class Segment:
         """
         self.mediums.append(medium)
 
-    def intersect(self, ray, t, map):
+    def hit(self, p0, p1):
+        """First crossing of the trace ``p0 -> p1`` with this wall.
+
+        :return: ``None`` if the trace does not cross the wall, otherwise
+            ``(s, intersect, n, d)`` with ``s`` the distance of the crossing from
+            ``p0`` [mm], ``n`` the unit normal oriented AWAY from the side the
+            trace comes from (into the medium behind the wall) and ``d`` the
+            matching unit tangent.
         """
-        Intersects last trace of ray with self
+        # direct kernel call: trace points and endpoints are float64 arrays
+        intersect = _seg_seg_intersect_2d_numba(p0, p1, self._a1, self._a2, _SEG_TOL)
+        if intersect[0] != intersect[0]:  # NaN -> no intersection
+            return None
+
+        # self.n is the right-hand normal of self.d, and cross > 0 means the
+        # trace starts on the left of the wall.
+        if cross_2d(self.d, p0 - self._a1) > 0:
+            n, d = self.n, self.d
+        else:
+            n, d = -self.n, -self.d
+
+        return norm_2d(intersect - p0), intersect, n, d
+
+    def interact(self, ray, n, d, intersect, t, map):
+        """Reflect/refract ``ray`` at the crossing found by ``hit`` (see ``_interact``)."""
+        return _interact(self, ray, n, d, intersect, t, map)
+
+    def intersect(self, ray, t, map):
+        """Intersect the last trace of ``ray`` with self and reflect/refract it.
+
+        Kept for external callers; ``Ray.trace`` uses ``hit`` on every object of
+        the medium and interacts only with the nearest crossing.
 
         :param ray: ray that intersects
         :param t: time of analysis
         :return: reflected/refracted new rays
         """
-
-        # get intersections and kill/spawn rays at intersections
-        intersect = seg_seg_intersect_2d(ray.trace_points[-2], ray.trace_points[-1], self.a1, self.a2)
-
-        if intersect is not None:
-            irays = []
-            # Find out where is the ray coming from:
-            # theta_n = math.atan(self.n[1]/self.n[0])  # assumes incident speed ratio at normal direction
-
-            # for i, m in enumerate(self.mediums):
-            #     if m == ray.medium:
-            #         ratio = self.ratio[i]/sum(self.ratio)
-
-            # if ratio is None:
-            #     raise TypeError('Impossible intersection found for ray: {} on segment {}\n check medium definition'
-            #                     .format(ray, self))
-
-            if cross_2d(self.d, ray.trace_points[-2]-self.a1) > 0:
-                n = self.n
-                d = self.d
-
-            else:
-                # the normal points to the side from where the ray comes,
-                # because trigonometry is easier this way
-                n = -self.n
-                d = -self.d
-
-            # estimate intersc. time
-            # d_int = dot_2d(ray.d, i)
-            t_int = norm_2d(intersect-ray.trace_points[-2]) / norm_2d(ray.trace_points[-1]-ray.trace_points[-2]) \
-                    * (t-ray.int_times[-2]) + ray.int_times[-2]
-            # ray parameters at intersection
-            # rd, ra, rf, rt = ray.d[-1], ray.a[-1], ray.freq[-1].copy(), ray.t
-
-            # Reflect ray
-            # ratio_rfl = self.ratio_rfl if len(self.mediums) > 1 else 1.  # if only one medium all is reflected -> NO!
-            irays_rfl, ray_params_i = ray_refl(ray, n, d, intersect, t_int, t,
-                                               ratio=self.ratio_rfl, ratio_mode=self.ratio_mode,
-                                               bl=self.bl, map=map)
-            irays.extend(irays_rfl)
-
-            # Refract ray on all remaining boundaries
-            if len(self.mediums) > 1:
-                x_i, trace_i, d_i, f_i, a_i, t_i = ray_params_i
-                ratio_rfr = (1 - self.ratio_rfl) / (len(self.mediums) - 1)  # self.ratio[i] / sum(self.ratio)
-                for i, m2 in enumerate(self.mediums):
-                    if not m2 == ray.medium:
-                        irays.extend(ray_refr(ray, n, d, intersect, t_int, t, d_i, a_i, f_i,
-                                              ratio=ratio_rfr, m2=m2, ratio_mode=self.ratio_mode,
-                                              bl=self.bl, map=map))
-            # # generate opposite kind echo?
-            # if rfr_ray is not None:
-            #     irays.append(rfr_ray)
-
-            return irays
-        return []
+        h = self.hit(ray.trace_points[-2], ray.trace_points[-1])
+        if h is None:
+            return []
+        _, intersect, n, d = h
+        return _interact(self, ray, n, d, intersect, t, map)
 
     def plot(self, ax, color='default', marker=None):
         if color == 'default':
@@ -278,11 +297,119 @@ class Segment:
         return xmax, xmin, ymax, ymin
 
 
+class Ellipse:
+    def __init__(self, c, a, b, phi=0., boundary_losses=0.2,
+                 color='black',
+                 B=np.array([[1, 0, 0], [0, 1, 0]]), P=np.zeros(3),
+                 ratio_rfl=0.8, ratio_mode=0.9):
+        """Elliptical boundary that rays reflect on / refract through.
+
+        Same interface as ``Segment`` (``add_medium``, ``intersect``, ``plot``,
+        ``get_limits``) so it can be added to a ``medium`` like any wall.  A
+        circular boundary is ``Ellipse(c, r, r)`` (``Circunf`` is plot/sensor
+        only and does not interact with rays).
+
+        The ellipse may be a hole in a larger (non-convex) medium: ``Ray.trace``
+        interacts with the nearest crossing among all the objects of the medium,
+        so the order of ``objs`` does not matter.
+
+        :param c: centre [mm]
+        :param a: semi-axis along the local x direction [mm]
+        :param b: semi-axis along the local y direction [mm]
+        :param phi: rotation of the local x axis w.r.t. the global one [rad]
+        """
+        self.c = np.asarray(c, dtype=float)
+        self.a = float(a)
+        self.b = float(b)
+        self.phi = float(phi)
+        # contiguous float64 copies / scalars for direct calls into the Numba kernel
+        self._c = np.ascontiguousarray(self.c, dtype=np.float64)
+        self._cos = float(np.cos(self.phi))
+        self._sin = float(np.sin(self.phi))
+
+        self.color = color
+
+        # List of mediums that contain the boundary
+        self.mediums = []
+
+        # energy factors
+        self.ratio_rfl = ratio_rfl
+        self.ratio_mode = ratio_mode
+        self.bl = boundary_losses
+
+        self.B = B
+        self.P = P
+
+    def add_medium(self, medium):
+        """ Adds medium to list
+        """
+        self.mediums.append(medium)
+
+    def contains(self, p):
+        """True if the point ``p`` lies inside the ellipse."""
+        v = np.asarray(p, dtype=float) - self.c
+        u = (self._cos * v[0] + self._sin * v[1]) / self.a
+        w = (-self._sin * v[0] + self._cos * v[1]) / self.b
+        return u * u + w * w < 1.
+
+    def hit(self, p0, p1):
+        """First crossing of the trace ``p0 -> p1`` with the ellipse (see ``Segment.hit``)."""
+        res = _ellipse_seg_intersect_2d_numba(self._c, self.a, self.b, self._cos, self._sin,
+                                              p0, p1, _SEG_TOL)
+        if res[0] != res[0]:  # NaN -> no intersection
+            return None
+
+        intersect = res[:2].copy()
+        n_out = res[2:4].copy()
+        # n must point away from the side the trace comes from (see Segment):
+        # outward when it comes from inside, inward otherwise
+        n = n_out if res[4] > 0.5 else -n_out
+        d = np.array([-n[1], n[0]])
+        return norm_2d(intersect - p0), intersect, n, d
+
+    def interact(self, ray, n, d, intersect, t, map):
+        """Reflect/refract ``ray`` at the crossing found by ``hit`` (see ``_interact``)."""
+        return _interact(self, ray, n, d, intersect, t, map)
+
+    def intersect(self, ray, t, map):
+        """Intersect the last trace of ``ray`` with self and reflect/refract it
+        (see ``Segment.intersect``)."""
+        h = self.hit(ray.trace_points[-2], ray.trace_points[-1])
+        if h is None:
+            return []
+        _, intersect, n, d = h
+        return _interact(self, ray, n, d, intersect, t, map)
+
+    def plot(self, ax, color='default', marker=None):
+        if color == 'default':
+            color = self.color
+        if color is None:
+            return
+
+        from matplotlib.patches import Ellipse as _MplEllipse
+        c = self.B.T.dot(self.c) + self.P
+        e = _MplEllipse((c[0], c[1]), 2 * self.a, 2 * self.b,
+                        angle=np.degrees(self.phi), color=color, fill=False, zorder=2)
+        ax.add_patch(e)
+
+        if marker is not None:
+            ax.plot(c[0], c[1], marker=marker, color=color)
+
+    def get_limits(self):
+        """Axis-aligned bounding box of the rotated ellipse."""
+        hx = (self.a ** 2 * self._cos ** 2 + self.b ** 2 * self._sin ** 2) ** 0.5
+        hy = (self.a ** 2 * self._sin ** 2 + self.b ** 2 * self._cos ** 2) ** 0.5
+        return self.c[0] + hx, self.c[0] - hx, self.c[1] + hy, self.c[1] - hy
+
+
 class Circunf:
     def __init__(self, c, r, color='black'):
         self.c = c
         self.r = r
-               
+        # contiguous float64 copies for direct calls into the Numba kernels
+        self._c = np.ascontiguousarray(c, dtype=np.float64)
+        self._r = float(r)
+
         self.color = color
         
         self.npos=None

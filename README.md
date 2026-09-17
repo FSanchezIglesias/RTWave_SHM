@@ -30,6 +30,23 @@ s1 = Segment(np.array([-500, -100]), np.array([500, 100]))
 pzt = Sensor('circ', [[0,-200], 12.])
 ```
 
+Curved boundaries are `Ellipse(c, a, b, phi)` (centre, semi-axes, rotation
+in rad; `Ellipse(c, r, r)` is a circle). They take the same
+`boundary_losses`/`ratio_rfl`/`ratio_mode` parameters as `Segment` and are
+added to mediums the same way. Rays interact with the *nearest* boundary
+crossed by their trace, so a medium may be non-convex: a damage is simply a
+hole in the plate medium (its boundary objects are added to both mediums)
+and no auxiliary invisible walls are needed.
+
+The MUSE example supports both damage shapes:
+`gen_MUSE_dmg(shape='rect')` (default, `XLDMG x YLDMG` box) and
+`gen_MUSE_dmg(shape='ellipse', phidmg=<rad>)` (ellipse with full axes
+`XLDMG`, `YLDMG`); `example/plate_config.py` holds `DMG_SHAPE` / `PHIDMG`.
+Both build 2 mediums (plate with the damage as a hole + damage). The
+legacy convex-cell mesh with invisible walls is still available as
+`gen_MUSE_dmg(..., mesh='cells')`; it is only needed for solvers that
+interact with the first rather than the nearest crossed wall (v1).
+
 ### Define a wave speed class
 ```python
 class WS:
@@ -134,12 +151,35 @@ from the 1e-8 mm offset applied to reflected rays); with the default `True`
 the reflected arrivals change and the NRMSE is 0.15, while the direct-arrival
 windows of the nearest sensors agree to 2e-4 – 2e-3.
 
+Two further exact steps were added after that validation (measured on a
+different workstation, best of three runs; NRMSE vs the solver output before
+the step; see `Optimization/New/Performance_Evolution_stage3.csv`):
+
+| Step | Optimization | Tracing (s) | Signal (s) | Total (s) | Incr. (×) | NRMSE |
+|---:|---|---:|---:|---:|---:|---:|
+| 14 | validated solver (baseline) | 1.57 | 0.86 | 2.43 | — | — |
+| 15 | one inverse FFT per chord run (cumulative spectra + direct DFT on the mask transition window) | 1.50 | 0.20 | 1.70 | 1.42 | 2.3e-16 |
+| 16 | direct Numba kernel calls with pre-stored float64 geometry; byte-based ray hash | 1.26 | 0.19 | 1.45 | 1.17 | 2.3e-16 |
+
 ## Tests
 
 ```bash
 python tests/test_signal_on_ray.py
+python tests/test_ellipse.py
+python tests/test_hole_mesh.py
 python tests/compare_v1_v2.py --v1-dir <v1 snapshot dir> --nrays 201
+python tests/compare_cells_holes.py [--full] [--shape ellipse] [--plot]
 ```
+
+`tests/test_hole_mesh.py` checks the nearest-hit tracing and that the
+2-medium hole mesh reproduces the legacy cell mesh (NRMSE < 1e-5) and, for
+a transparent damage, the intact plate. `tests/compare_cells_holes.py` runs
+the same comparison as two subprocesses (hole mesh vs cell mesh, current
+solver) and prints per-sensor NRMSE, ray counts and timings: on the full
+benchmark the meshes agree to 8e-9 and the hole mesh is ~1.2x faster.
+`tests/test_ellipse.py` checks the ellipse intersection kernel and that a
+fully transparent elliptical damage (`rdmg=0, bldmg=0, rmdmg=1, thdmg=TH,
+xidmg=1e-3`) reproduces the intact-plate signals (NRMSE < 1e-6).
 
 The v1 snapshot is `git archive 9b00afb geom RayTracing utils_rays __init__.py`
 extracted into a folder, with `signal_f(self.t, self.a0, f, fd)` in

@@ -13,13 +13,22 @@ for _p in (_REPO_ROOT, _THIS_DIR):
         sys.path.insert(0, _p)
 
 from geom.objects_2d import Segment, medium
+try:
+    from geom.objects_2d import Ellipse
+except ImportError:  # older package copies (e.g. the v1 snapshot used by tests/compare_v1_v2.py)
+    Ellipse = None
 from RayTracing.Sensors import Sensor
 from geom.map_2d import Map2D
 from geom.geom_utils import circunf_seg_intersect_2d, seg_seg_intersect_2d
+try:
+    from geom.geom_utils import ellipse_seg_intersect_2d
+except ImportError:  # older package copies (see Ellipse below)
+    ellipse_seg_intersect_2d = None
 from wavespeed import wavespeed_composite
 from plate_config import (
     L, TH, R_PZT, BL, PZT_POS, WAVESPEED_HDF5,
     XDMG, YDMG, XLDMG, YLDMG, THDMG, RDMG, BLDMG, RMDMG,
+    DMG_SHAPE, PHIDMG,
 )
 
 
@@ -43,10 +52,29 @@ thdmg = THDMG
 rdmg = RDMG
 bldmg = BLDMG
 rmdmg = RMDMG
+shape = DMG_SHAPE
+phidmg = PHIDMG
+
+# Clearance [mm] between an elliptical damage and the transparent cell
+# (invisible walls) built around it -- only used by ``mesh='cells'``.
+ELLIPSE_CELL_MARGIN = 2.
 
 
-def _seg_intersects_sensor(seg: Segment, sensor: Sensor) -> bool:
-    """Return True if *seg* intersects any boundary of *sensor*."""
+def _seg_intersects_sensor(seg, sensor: Sensor) -> bool:
+    """Return True if the boundary *seg* (``Segment`` or ``Ellipse``)
+    intersects any boundary of *sensor*."""
+    if Ellipse is not None and isinstance(seg, Ellipse):
+        # sample the sensor outline and test every edge against the ellipse
+        for b in sensor.bounds:
+            if hasattr(b, 'c'):  # _CircBoundary
+                psi = np.linspace(0., 2 * np.pi, 73)
+                pts = b.c + b.r * np.column_stack([np.cos(psi), np.sin(psi)])
+            else:
+                pts = np.array([b.a1, b.a2])
+            for p1, p2 in zip(pts[:-1], pts[1:]):
+                if ellipse_seg_intersect_2d(seg.c, seg.a, seg.b, seg.phi, p1, p2) is not None:
+                    return True
+        return False
     for b in sensor.bounds:
         if hasattr(b, 'c'):  # _CircBoundary
             if circunf_seg_intersect_2d(b.c, b.r, seg.a1, seg.a2):
@@ -65,6 +93,7 @@ def _any_intersect(segs: list, sensors: list) -> bool:
 def _build_vertical(
     xdmg: float, xldmg: float, ydmg: float, yldmg: float,
     l: float, bl: float, rdmg: float, bldmg: float, rmdmg: float,
+    cell_kw: dict = None,
 ) -> tuple:
     """Build 5-element vertical mesh (big left/right elements).
 
@@ -79,7 +108,10 @@ def _build_vertical(
         └─────┴──────┴─────┘
 
     Invisible walls are the 4 vertical segments at x=xl and x=xr,
-    above and below the damage zone.
+    above and below the damage zone.  ``cell_kw`` overrides the Segment
+    kwargs of the 4 walls of the central (damage) cell: by default they are
+    damage walls (``kw_dmg``); the ellipse layout passes invisible-wall
+    kwargs to make the cell transparent.
 
     Returns:
         (medium_objs, dmg_segs, inv_segs) where medium_objs is a list
@@ -106,6 +138,8 @@ def _build_vertical(
     kw_bl  = dict(boundary_losses=bl,    ratio_mode=1.)
     kw_dmg = dict(boundary_losses=bldmg, ratio_rfl=rdmg, ratio_mode=rmdmg, color='blue')
     kw_inv = dict(boundary_losses=0.,    ratio_rfl=0.,   ratio_mode=1.,    color='white')
+    if cell_kw is not None:
+        kw_dmg = cell_kw
 
     # Plate boundaries
     S_b1  = Segment(P1,  P2,  **kw_bl)
@@ -145,6 +179,7 @@ def _build_vertical(
 def _build_horizontal(
     xdmg: float, xldmg: float, ydmg: float, yldmg: float,
     l: float, bl: float, rdmg: float, bldmg: float, rmdmg: float,
+    cell_kw: dict = None,
 ) -> tuple:
     """Build 5-element horizontal mesh (big top/bottom elements).
 
@@ -159,7 +194,7 @@ def _build_horizontal(
         └───────────────────┘
 
     Invisible walls are the 4 horizontal segments at y=yb and y=yt,
-    left and right of the damage zone.
+    left and right of the damage zone.  ``cell_kw``: see ``_build_vertical``.
 
     Returns:
         (medium_objs, dmg_segs, inv_segs) where medium_objs is a list
@@ -186,6 +221,8 @@ def _build_horizontal(
     kw_bl  = dict(boundary_losses=bl,    ratio_mode=1.)
     kw_dmg = dict(boundary_losses=bldmg, ratio_rfl=rdmg, ratio_mode=rmdmg, color='blue')
     kw_inv = dict(boundary_losses=0.,    ratio_rfl=0.,   ratio_mode=1.,    color='white')
+    if cell_kw is not None:
+        kw_dmg = cell_kw
 
     # Plate boundaries
     S_b_full = Segment(P1,  P9,  **kw_bl)  # bottom plate (full width)
@@ -222,21 +259,159 @@ def _build_horizontal(
     return medium_objs, dmg_segs, inv_segs
 
 
+def _build_holes(xdmg, xldmg, ydmg, yldmg, l, bl, rdmg, bldmg, rmdmg, ellipse=None):
+    """Build the 2-medium mesh: the plate with the damage as a hole + the damage.
+
+    Layout::
+
+        +---------------+
+        |   plate       |
+        |     +---+     |
+        |     |dmg|     |
+        |     +---+     |
+        +---------------+
+
+    No invisible walls: ``Ray.trace`` interacts with the nearest crossing, so
+    the plate medium may be non-convex.  ``ellipse`` (an ``Ellipse``) replaces
+    the 4 rectangular damage walls when given.
+
+    Returns:
+        (medium_objs, dmg_objs) where medium_objs is [plate, dmg].
+    """
+    P1 = np.array([0., 0.])
+    P2 = np.array([l,  0.])
+    P3 = np.array([l,  l])
+    P4 = np.array([0., l])
+
+    kw_bl  = dict(boundary_losses=bl,    ratio_mode=1.)
+    kw_dmg = dict(boundary_losses=bldmg, ratio_rfl=rdmg, ratio_mode=rmdmg, color='blue')
+
+    plate = [Segment(P1, P2, **kw_bl), Segment(P2, P3, **kw_bl),
+             Segment(P3, P4, **kw_bl), Segment(P4, P1, **kw_bl)]
+
+    if ellipse is not None:
+        dmg_objs = [ellipse]
+    else:
+        xl = xdmg - xldmg / 2
+        xr = xdmg + xldmg / 2
+        yb = ydmg - yldmg / 2
+        yt = ydmg + yldmg / 2
+        Q1 = np.array([xl, yb])
+        Q2 = np.array([xr, yb])
+        Q3 = np.array([xl, yt])
+        Q4 = np.array([xr, yt])
+        dmg_objs = [Segment(Q1, Q2, **kw_dmg), Segment(Q1, Q3, **kw_dmg),
+                    Segment(Q2, Q4, **kw_dmg), Segment(Q3, Q4, **kw_dmg)]
+
+    medium_objs = [dmg_objs + plate, list(dmg_objs)]
+    return medium_objs, dmg_objs
+
+
+def _sensor_inside_damage(pzt, ellipse, xdmg, xldmg, ydmg, yldmg) -> bool:
+    """True if the sensor centre lies inside the damage zone."""
+    c = pzt.origin()
+    if ellipse is not None:
+        return ellipse.contains(c)
+    return (xdmg - xldmg / 2 <= c[0] <= xdmg + xldmg / 2 and
+            ydmg - yldmg / 2 <= c[1] <= ydmg + yldmg / 2)
+
+
 def gen_MUSE_dmg(ws=ws, r_pzt=r_pzt, bl=bl, l=l, th=th, pzt_pos=pzt_pos,
                  xdmg=xdmg, xldmg=xldmg, ydmg=ydmg, yldmg=yldmg,
-                 wsdmg=ws, rdmg=rdmg, bldmg=bldmg, rmdmg=rmdmg, thdmg=thdmg):
+                 wsdmg=ws, rdmg=rdmg, bldmg=bldmg, rmdmg=rmdmg, thdmg=thdmg,
+                 shape=shape, phidmg=phidmg, xidmg=5.e-3, mesh='holes'):
+    """Plate with one damage zone centred at (xdmg, ydmg).
+
+    :param shape: ``'rect'`` -- rectangle of sides xldmg x yldmg bounded by 4
+        damage walls.  ``'ellipse'`` -- ellipse with full axes xldmg (local x)
+        and yldmg (local y) rotated by ``phidmg`` [rad].
+    :param phidmg: rotation of the ellipse [rad], ignored for ``'rect'``
+    :param xidmg: damping of the damage medium (plate mediums use 1e-3)
+    :param mesh: ``'holes'`` (default) -- 2 mediums: the plate with the damage
+        as a hole, and the damage.  ``'cells'`` -- legacy convex-cell mesh with
+        invisible walls (5 mediums for ``'rect'``, 6 for ``'ellipse'`` where
+        the ellipse sits inside a transparent rectangular cell); required by
+        solvers that interact with the first, not the nearest, crossed wall
+        (the frozen v1 snapshot of ``tests/compare_v1_v2.py``).
+    """
+    shape = shape.lower()
+    if shape not in ('rect', 'ellipse'):
+        raise ValueError("Unknown damage shape: {!r} (use 'rect' or 'ellipse')".format(shape))
+    mesh = mesh.lower()
+    if mesh not in ('holes', 'cells'):
+        raise ValueError("Unknown mesh: {!r} (use 'holes' or 'cells')".format(mesh))
 
     pzts = [Sensor('circ', [p, r_pzt], name='PZT{}'.format(i + 1))
             for i, p in enumerate(pzt_pos)]
 
+    if shape == 'ellipse':
+        if Ellipse is None:
+            raise ImportError('geom.objects_2d.Ellipse is not available in this package copy')
+        ellipse = Ellipse(np.array([xdmg, ydmg]), xldmg / 2., yldmg / 2., phi=phidmg,
+                          boundary_losses=bldmg, ratio_rfl=rdmg, ratio_mode=rmdmg,
+                          color='blue')
+    else:
+        ellipse = None
+
+    if mesh == 'holes':
+        medium_objs, dmg_objs = _build_holes(
+            xdmg, xldmg, ydmg, yldmg, l, bl, rdmg, bldmg, rmdmg, ellipse=ellipse
+        )
+        if _any_intersect(dmg_objs, pzts):
+            raise ValueError(
+                'A damage boundary intersects a sensor circumference. '
+                'Reposition the damage or the sensors.'
+            )
+        for pzt in pzts:
+            if _sensor_inside_damage(pzt, ellipse, xdmg, xldmg, ydmg, yldmg):
+                raise ValueError(
+                    'Sensor {} lies inside the damage. '
+                    'Reposition the damage or the sensors.'.format(pzt.name)
+                )
+        mediums = [
+            medium(ws,    th,    xi=1.e-3),   # plate (damage is a hole)
+            medium(wsdmg, thdmg, xi=xidmg),   # damage
+        ]
+    else:
+        medium_objs, mediums = _gen_cells(
+            pzts, ellipse, ws, wsdmg, th, thdmg, xidmg, bl, l,
+            xdmg, xldmg, ydmg, yldmg, rdmg, bldmg, rmdmg
+        )
+
+    for m, objs in zip(mediums, medium_objs):
+        m.add_objs(objs)
+
+    map_ = Map2D(mediums=mediums, background=False)
+    for pzt in pzts:
+        try:
+            map_.add_sensor(pzt)
+        except KeyError as e:
+            print(e)
+
+    return map_, pzts
+
+
+def _gen_cells(pzts, ellipse, ws, wsdmg, th, thdmg, xidmg, bl, l,
+               xdmg, xldmg, ydmg, yldmg, rdmg, bldmg, rmdmg):
+    """Legacy convex-cell mesh (``mesh='cells'``): see ``gen_MUSE_dmg``."""
+    if ellipse is not None:
+        # transparent cell = bounding box of the rotated ellipse + margin
+        xmax_e, xmin_e, ymax_e, ymin_e = ellipse.get_limits()
+        xlcell = xmax_e - xmin_e + 2 * ELLIPSE_CELL_MARGIN
+        ylcell = ymax_e - ymin_e + 2 * ELLIPSE_CELL_MARGIN
+        cell_kw = dict(boundary_losses=0., ratio_rfl=0., ratio_mode=1., color='white')
+    else:
+        xlcell, ylcell = xldmg, yldmg
+        cell_kw = None
+
     # Try vertical mesh first; fall back to horizontal if invisible walls
     # intersect any sensor circumference.
     medium_objs, dmg_segs, inv_segs = _build_vertical(
-        xdmg, xldmg, ydmg, yldmg, l, bl, rdmg, bldmg, rmdmg
+        xdmg, xlcell, ydmg, ylcell, l, bl, rdmg, bldmg, rmdmg, cell_kw
     )
     if _any_intersect(inv_segs, pzts):
         medium_objs, dmg_segs, inv_segs = _build_horizontal(
-            xdmg, xldmg, ydmg, yldmg, l, bl, rdmg, bldmg, rmdmg
+            xdmg, xlcell, ydmg, ylcell, l, bl, rdmg, bldmg, rmdmg, cell_kw
         )
         if _any_intersect(inv_segs, pzts):
             raise ValueError(
@@ -251,25 +426,40 @@ def gen_MUSE_dmg(ws=ws, r_pzt=r_pzt, bl=bl, l=l, th=th, pzt_pos=pzt_pos,
             'Reposition the damage or the sensors.'
         )
 
-    # Index 2 is always the damage medium across both layouts.
-    mediums = [
-        medium(ws,    th,    xi=1.e-3),
-        medium(ws,    th,    xi=1.e-3),
-        medium(wsdmg, thdmg, xi=5.e-3),
-        medium(ws,    th,    xi=1.e-3),
-        medium(ws,    th,    xi=1.e-3),
-    ]
-    for m, objs in zip(mediums, medium_objs):
-        m.add_objs(objs)
-
-    map_ = Map2D(mediums=mediums, background=False)
-    for pzt in pzts:
-        try:
-            map_.add_sensor(pzt)
-        except KeyError as e:
-            print(e)
-
-    return map_, pzts
+    if ellipse is not None:
+        # No sensor may sit inside the transparent cell: it would either cut
+        # the ellipse or fail Map2D.add_sensor's single-medium requirement.
+        for pzt in pzts:
+            c = pzt.origin()
+            if (xdmg - xlcell / 2 <= c[0] <= xdmg + xlcell / 2 and
+                    ydmg - ylcell / 2 <= c[1] <= ydmg + ylcell / 2):
+                raise ValueError(
+                    'Sensor {} lies inside the cell around the elliptical damage. '
+                    'Reposition the damage or the sensors.'.format(pzt.name)
+                )
+        # Split the central cell into the frame medium (cell walls with the
+        # ellipse as a hole) and the damage medium (ellipse interior).
+        medium_objs = (medium_objs[:2]
+                       + [[ellipse] + list(medium_objs[2]), [ellipse]]
+                       + medium_objs[3:])
+        mediums = [
+            medium(ws,    th,    xi=1.e-3),
+            medium(ws,    th,    xi=1.e-3),
+            medium(ws,    th,    xi=1.e-3),   # frame around the ellipse
+            medium(wsdmg, thdmg, xi=xidmg),   # damage (ellipse interior)
+            medium(ws,    th,    xi=1.e-3),
+            medium(ws,    th,    xi=1.e-3),
+        ]
+    else:
+        # Index 2 is always the damage medium across both layouts.
+        mediums = [
+            medium(ws,    th,    xi=1.e-3),
+            medium(ws,    th,    xi=1.e-3),
+            medium(wsdmg, thdmg, xi=xidmg),
+            medium(ws,    th,    xi=1.e-3),
+            medium(ws,    th,    xi=1.e-3),
+        ]
+    return medium_objs, mediums
 
 
 def gen_MUSE_intact(ws=ws, r_pzt=r_pzt, bl=bl, l=l, pzt_pos=pzt_pos):

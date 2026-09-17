@@ -1,6 +1,6 @@
 import numpy as np
 from scipy.fft import rfft, rfftfreq, irfft
-from geom.geom_utils import norm_2d
+from geom.geom_utils import norm_2d, wrap_angle_pi
 # from utils_rays.ray_utils import save_ray
 from RayTracing.Signal import burst_hann
 import logging
@@ -68,8 +68,9 @@ class Ray:
         self.a = [a, ]
 
         self.x = [0., ]
-        self.trace_points = [origin, ]
-        self.d = [direction / norm_2d(direction), ]
+        # float64 arrays so that intersection kernels can be called directly
+        self.trace_points = [np.ascontiguousarray(origin, dtype=np.float64), ]
+        self.d = [np.ascontiguousarray(direction / norm_2d(direction), dtype=np.float64), ]
 
         self.int_times = [t0, ]
         self.freq = [freq, ]
@@ -91,10 +92,12 @@ class Ray:
         self._dom_freq_idx = np.argmax(np.abs(freq))
         self._dom_freq = self.fft_freq[self._dom_freq_idx]
 
-        # Cache hash — computed once, uses immutable initial state
-        self._hash = hash(hash(self.kind) + hash(tuple(self.d[0])) +
-                          hash(tuple(self.trace_points[0])) + hash(self.int_times[0]) +
-                          hash(tuple(self.freq[0])))
+        # Cache hash — computed once from the immutable initial state
+        # (kind + direction + origin + birth time + spectrum). Array contents are
+        # hashed through their raw bytes; building 500-element tuples was a
+        # measurable cost per spawned ray.
+        self._hash = hash((self.kind, self.d[0].tobytes(), self.trace_points[0].tobytes(),
+                           float(self.int_times[0]), np.asarray(self.freq[0]).tobytes()))
 
     def _dispersion_for_direction(self, d) -> tuple:
         """Phase-velocity array and dispersion coefficient for direction ``d``.
@@ -107,7 +110,7 @@ class Ray:
                  a distance ``x``.
         """
         medium = self.medium
-        theta = (np.arctan2(d[1], d[0]) + medium.theta) % np.pi
+        theta = wrap_angle_pi(np.arctan2(d[1], d[0]) + medium.theta)
         th_factor = medium.th / 1.E+6
 
         # Batch interpolation: single Numba call instead of n_fft Python round-trips
@@ -235,15 +238,28 @@ class Ray:
         # -- keep track of new rays --
         rfr_rays = []
 
-        for sens in self.medium.sensors:
-            # rfr_rays.extend(obj.intersect(self, t, r_map)) # sensors don't interact
-            sens.intersect(self, t, r_map)
-
+        # Find the NEAREST boundary crossed by the last trace segment: the
+        # medium may be non-convex (e.g. a plate with the damage as a hole),
+        # so several walls may be crossed and the order of medium.objs must
+        # not matter.
+        p0, p1 = self.trace_points[-2], self.trace_points[-1]
+        best_s = None
+        best = None
         for obj in self.medium.objs:
-            inter = obj.intersect(self, t, r_map)
-            if inter:
-                rfr_rays.extend(inter)
-                break
+            h = obj.hit(p0, p1)
+            if h is not None and (best_s is None or h[0] < best_s):
+                best_s = h[0]
+                best = (obj, h)
+
+        # Sensors only see the trace up to that boundary: the part beyond it
+        # is an overshoot that the reflection/refraction below discards.
+        p_end = p1 if best is None else best[1][1]
+        for sens in self.medium.sensors:
+            sens.intersect(self, t, r_map, p_end)  # sensors don't interact
+
+        if best is not None:
+            obj, (_, intersect, n, d) = best
+            rfr_rays.extend(obj.interact(self, n, d, intersect, t, r_map))
 
         r_map.save_ray(self)  # saves ray
         return rfr_rays

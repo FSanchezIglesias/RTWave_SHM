@@ -32,7 +32,7 @@ def ray_refl(ray, n, d, intersect, t_int, t,
     a_rfl = a_i * ratio * ratio_mode * (1 - bl)
     a_mc = a_i * ratio * (1 - ratio_mode) * (1 - bl)
 
-    # Early-return for invisible walls (ratio_rfl=0): skip direction compute + dead trace
+    # Early-return for fully transparent walls (ratio_rfl=0): skip direction compute + dead trace
     if a_rfl <= a_tol and a_mc <= a_tol:
         ray.set_param(x_i, intersect, d_i, f_i, 0.0, t_int, i=-1)
         return irays, ray_params_i

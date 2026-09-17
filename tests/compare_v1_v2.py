@@ -34,6 +34,7 @@ def run(code_dir: str, out: str, args: argparse.Namespace, log: str,
            '--code-dir', code_dir, '--out', out, '--case', args.case,
            '--nrays', str(args.nrays), '--nt', str(args.nt), '--tmax', str(args.tmax),
            '--nfft', str(args.nfft), '--source', str(args.source), '--log', log,
+           '--mesh', 'cells',  # v1 interacts with the first crossed wall: needs convex cells
            *extra]
     res = subprocess.run(cmd, cwd=_REPO_ROOT, capture_output=True, text=True)
     if res.returncode != 0:
@@ -96,6 +97,9 @@ def main() -> None:
     ap.add_argument('--v2-birth-dispersion', action='store_true',
                     help='run v2 with the birth-direction dispersion curve kept after '
                          'reflections (v1 physics); output file gets suffix _birth')
+    ap.add_argument('--ref-file', default=None,
+                    help='compare the v2 output against this HDF5 file (e.g. an earlier '
+                         'v2 output) instead of the v1 run')
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -116,10 +120,11 @@ def main() -> None:
         if r1 and r2 and r2['t_total'] > 0:
             print('speed-up (total): {:.1f}x'.format(r1['t_total'] / r2['t_total']))
 
-    t, ref, cols = load(f1)
+    t, ref, cols = load(args.ref_file or f1)
     _, new, cols2 = load(f2)
     assert cols == cols2, (cols, cols2)
-    print('signal RMS (v1): {:.3e}   peak (v1): {:.3e}'.format(
+    print('reference: {}'.format(args.ref_file or f1))
+    print('signal RMS (ref): {:.3e}   peak (ref): {:.3e}'.format(
         np.sqrt(np.mean(ref ** 2)), np.abs(ref).max()))
     metrics(t, ref, new, cols, tuple(args.window))
 

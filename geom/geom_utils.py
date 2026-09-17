@@ -127,6 +127,75 @@ def _circunf_seg_intersect_2d_numba(circle_center, circle_radius, pt1, pt2, full
             
     return temp_res[:valid_count]
 
+
+@jit(nopython=True, cache=True)
+def _ellipse_seg_intersect_2d_numba(c, a, b, cos_phi, sin_phi, p1, p2, tol=1.e-9):
+    """First crossing of the segment p1->p2 with an ellipse.
+
+    The ellipse has centre ``c``, semi-axes ``a`` (local x) and ``b`` (local y)
+    and is rotated by ``phi`` (given through ``cos_phi``/``sin_phi``).
+
+    Returns a length-5 array ``[px, py, nx, ny, inside]``: hit point, outward
+    unit normal at the hit and ``inside == 1.0`` when ``p1`` lies inside the
+    ellipse.  All-NaN when the segment does not cross the ellipse.  ``tol`` is a
+    distance tolerance [mm] on the segment parameter, with the same meaning as
+    in ``_seg_seg_intersect_2d_numba``: roots closer than ``tol`` behind ``p1``
+    are accepted, roots further behind are not.
+    """
+    # segment in the ellipse frame, scaled to the unit circle
+    vx1 = p1[0] - c[0]
+    vy1 = p1[1] - c[1]
+    vx2 = p2[0] - c[0]
+    vy2 = p2[1] - c[1]
+    u1 = (cos_phi * vx1 + sin_phi * vy1) / a
+    w1 = (-sin_phi * vx1 + cos_phi * vy1) / b
+    u2 = (cos_phi * vx2 + sin_phi * vy2) / a
+    w2 = (-sin_phi * vx2 + cos_phi * vy2) / b
+
+    du = u2 - u1
+    dw = w2 - w1
+    A = du * du + dw * dw
+    B = 2.0 * (u1 * du + w1 * dw)
+    C = u1 * u1 + w1 * w1 - 1.0
+
+    res = np.full((5,), np.nan)
+    if A < 1e-30:
+        return res
+    disc = B * B - 4.0 * A * C
+    if disc < 0.0:
+        return res
+    sq = disc ** 0.5
+    t_lo = (-B - sq) / (2.0 * A)
+    t_hi = (-B + sq) / (2.0 * A)
+
+    rx = p2[0] - p1[0]
+    ry = p2[1] - p1[1]
+    len_r = (rx * rx + ry * ry) ** 0.5
+    tol_t = tol / len_r if len_r > 0 else 0.0
+
+    t = np.nan
+    if (-tol_t <= t_lo) and (t_lo <= 1.0 + tol_t):
+        t = t_lo
+    elif (-tol_t <= t_hi) and (t_hi <= 1.0 + tol_t):
+        t = t_hi
+    if t != t:
+        return res
+
+    # hit point (global) and outward normal from the local gradient
+    ul = u1 + t * du
+    wl = w1 + t * dw
+    gx = ul / a
+    gy = wl / b
+    gn = (gx * gx + gy * gy) ** 0.5
+    gx /= gn
+    gy /= gn
+    res[0] = p1[0] + t * rx
+    res[1] = p1[1] + t * ry
+    res[2] = cos_phi * gx - sin_phi * gy
+    res[3] = sin_phi * gx + cos_phi * gy
+    res[4] = 1.0 if C < 0.0 else 0.0
+    return res
+
 # --- PYTHON API WRAPPERS ---
 
 def cross(a, b):
@@ -159,3 +228,38 @@ def circunf_seg_intersect_2d(circle_center, circle_radius, pt1, pt2, full_line=F
         return []
     
     return [row for row in res]
+
+
+def ellipse_seg_intersect_2d(c, a, b, phi, pt1, pt2, tol=1.e-9):
+    """First crossing of segment pt1->pt2 with a rotated ellipse.
+
+    :return: None, or array ``[px, py, nx, ny, inside]`` (see the Numba kernel)
+    """
+    res = _ellipse_seg_intersect_2d_numba(
+        np.asarray(c, dtype=np.float64), float(a), float(b),
+        float(np.cos(phi)), float(np.sin(phi)),
+        np.asarray(pt1, dtype=np.float64),
+        np.asarray(pt2, dtype=np.float64),
+        tol
+    )
+    if np.isnan(res[0]):
+        return None
+    return res
+
+
+_ANGLE_TOL = 1.e-9  # [rad] angles this close to pi are snapped to 0 (see wrap_angle_pi)
+
+
+def wrap_angle_pi(theta):
+    """Wrap a propagation angle to [0, pi), the range of the wave-speed tables.
+
+    A direction with a roundoff-level negative y component (e.g. produced by
+    reconstructing a direction from a non axis-aligned normal/tangent pair at
+    a curved boundary) has ``theta % pi`` equal to pi up to roundoff, which the
+    tables treat as a different angle from 0 although it is the same direction.
+    Such angles are snapped back to 0.
+    """
+    theta = theta % np.pi
+    if theta >= np.pi - _ANGLE_TOL:
+        return 0.
+    return theta

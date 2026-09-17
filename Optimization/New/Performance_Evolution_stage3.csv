@@ -1,0 +1,4 @@
+step, description, t_calc_t, t_calc_signal, t_total, incr, cumul_vs_step14, nrmse_vs_v2_base, nrmse_vs_v1_switch_off, applied
+14, baseline (final v2 with consistency fixes, dispersion_follows_direction=True; re-measured on the review workstation), 1.565, 0.863, 2.429, NA, 1.00, 0.0, 5.027e-09, NA
+15, one irfft per chord run: cumulative spectra + direct inverse-DFT on the mask transition window, 1.504, 0.201, 1.705, 1.42, 1.42, 2.340e-16, 5.027e-09, Yes
+16, direct Numba kernel calls with pre-stored float64 endpoints; byte-based ray hash, 1.261, 0.193, 1.454, 1.17, 1.67, 2.340e-16, 5.027e-09, Yes

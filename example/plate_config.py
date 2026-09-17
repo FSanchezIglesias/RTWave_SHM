@@ -39,6 +39,8 @@ THDMG = 3.
 RDMG = 0.1
 BLDMG = 0.05
 RMDMG = 1
+DMG_SHAPE = 'rect'                # 'rect' (XLDMG x YLDMG box) or 'ellipse' (full axes XLDMG, YLDMG)
+PHIDMG = 0.                       # ellipse rotation [rad], ignored for 'rect'
 
 # --- Simulation / source ---------------------------------------------------
 NRAYS = 2_001

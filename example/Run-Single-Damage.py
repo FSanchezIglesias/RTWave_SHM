@@ -16,6 +16,7 @@ from RayTracing.Ray import Beam_from_pzt
 from plate_config import (
     L, STACKING, MATERIAL,
     XDMG, YDMG, XLDMG, YLDMG, THDMG, RDMG, BLDMG, RMDMG,
+    DMG_SHAPE, PHIDMG,
     NRAYS, F, T,
 )
 
@@ -25,6 +26,13 @@ run_name = 'DMG12'
 xdmg, ydmg = XDMG, YDMG
 xldmg, yldmg = XLDMG, YLDMG
 thdmg, rdmg, bldmg, rmdmg = THDMG, RDMG, BLDMG, RMDMG
+shape, phidmg = DMG_SHAPE, PHIDMG
+if shape == 'ellipse':
+    dmg_type = '{:g}x{:g} mm elliptical damage'.format(xldmg, yldmg)
+elif xldmg == yldmg:
+    dmg_type = '{:g} mm square damage'.format(xldmg)
+else:
+    dmg_type = '{:g}x{:g} mm rectangular damage'.format(xldmg, yldmg)
 
 
 if __name__ == "__main__":
@@ -73,8 +81,9 @@ if __name__ == "__main__":
         #try:
         print(f'Source PZT{source+1}: Generating map.')
         m, pzts = gen_MUSE_dmg(
-            xdmg=xdmg, ydmg=ydmg, xldmg=xldmg, yldmg=yldmg, 
-            thdmg=thdmg, rdmg=rdmg , bldmg=bldmg, rmdmg=rmdmg
+            xdmg=xdmg, ydmg=ydmg, xldmg=xldmg, yldmg=yldmg,
+            thdmg=thdmg, rdmg=rdmg , bldmg=bldmg, rmdmg=rmdmg,
+            shape=shape, phidmg=phidmg,
         )
         print(f'Source PZT{source+1}: Setting initial beam.')
         ibeam_i1 = Beam_from_pzt(
@@ -92,9 +101,11 @@ if __name__ == "__main__":
         with h5py.File(hdf5_fname, 'a') as h5f:
                 if key in h5f:
                     # SUCCESS: The dataset exists
-                    h5f[key].attrs['dmg_type'] = '12 mm square damage'
+                    h5f[key].attrs['dmg_type'] = dmg_type
                     h5f[key].attrs['dmg_size'] = [xldmg, yldmg]
                     h5f[key].attrs['dmg_pos'] = [xdmg, ydmg]
+                    if shape == 'ellipse':
+                        h5f[key].attrs['dmg_angle'] = phidmg
                 else:
                     # FAILURE: The dataset was not created
                     logging.error(f"FAILED to save dataset {key}. Signal might be empty.")

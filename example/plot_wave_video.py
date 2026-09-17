@@ -17,6 +17,14 @@ import gc
 import os
 import sys
 
+# Allow running from anywhere: repo root (parent of example/) for the
+# `geom`/`RayTracing` packages, this folder for `MUSE_dmg`.
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(_THIS_DIR)
+for _p in (_REPO_ROOT, _THIS_DIR):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
 import matplotlib
 matplotlib.use('Agg')           # non-interactive backend — required for video
 import matplotlib.pyplot as plt
@@ -25,27 +33,47 @@ import numpy as np
 from scipy.fft import irfft
 from tqdm import tqdm
 
-# Allow running from anywhere: make sure the repo root (parent of this
-# example/ folder) is importable as the top-level `geom`/`RayTracing`
-# packages, and that this folder itself is importable for `MUSE_dmg`.
-_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(_THIS_DIR)
-for _p in (_REPO_ROOT, _THIS_DIR):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
-
-from MUSE_dmg import gen_MUSE_dmg
+from MUSE_dmg import gen_MUSE_dmg, gen_MUSE_intact
+# NOTE: import the same package modules MUSE_dmg uses (repo-root `geom`,
+# `RayTracing`), not `RTWave_SHM.geom...`: those would be distinct classes
+# and the isinstance() checks in draw_overlay would silently draw nothing.
 from RayTracing.Ray import Beam_from_pzt
-from geom.objects_2d import Segment
-from plate_config import (
-    L, XDMG, YDMG, XLDMG, YLDMG, THDMG, RDMG, BLDMG, RMDMG,
-    NRAYS, F, T, SOURCE_IDX,
-)
+from geom.objects_2d import Segment, Ellipse
 
 # ---------------------------------------------------------------------------
-# Simulation parameters — sourced from plate_config.py, shared with
-# Run-Single-Damage.py
+# Matplotlib style — LaTeX text rendering (match plot_intact_signals.py)
 # ---------------------------------------------------------------------------
+USE_LATEX = True
+plt.rcParams.update({
+    "text.usetex": USE_LATEX,
+    "font.family": "serif",
+    "font.serif": ["Times New Roman", "Times", "Computer Modern Roman"],
+    "font.size": 16,
+    "axes.labelsize": 18,
+    "axes.titlesize": 18,
+    "legend.fontsize": 16,
+    "xtick.labelsize": 16,
+    "ytick.labelsize": 16,
+})
+
+# ---------------------------------------------------------------------------
+# Simulation parameters  (match 02_Run-Single-Damage.py)
+# ---------------------------------------------------------------------------
+UNDAMAGED        = False    # True → intact plate (gen_MUSE_intact), no damage zone
+
+XDMG, YDMG       = 355., 147.
+XLDMG, YLDMG     = 48.,  24.
+DMG_SHAPE         = 'ellipse'         # 'rect' or 'ellipse' (see MUSE_dmg.gen_MUSE_dmg)
+PHIDMG            = np.deg2rad(30.)   # ellipse rotation [rad]
+THDMG             = 3.
+RDMG              = 0.1
+BLDMG             = 0.05
+RMDMG             = 1
+
+NRAYS             = 3_001
+F                 = 350.e3                          # Hz
+T                 = np.linspace(0., 0.0002, 10_000)   # s  (50 MHz)
+SOURCE_IDX        = 0                               # PZT1 as source
 
 # ---------------------------------------------------------------------------
 # Video / grid parameters
@@ -53,8 +81,15 @@ from plate_config import (
 N_FRAMES    = 200        # number of animation frames (subsampled from 10 000)
 GRIDLEN     = 2.         # mm per grid cell — coarser = faster precomputation
 FPS         = 5          # output frames per second
-VIDEOS_DIR  = os.path.join(_THIS_DIR, 'videos')
-OUTPUT      = os.path.join(VIDEOS_DIR, f'D-{XLDMG}_X-{XDMG}_Y-{YDMG}.mp4')
+_VIDEO_DIR  = os.path.join(_THIS_DIR, 'videos')
+if UNDAMAGED:
+    OUTPUT = os.path.join(_VIDEO_DIR, 'Intact.mp4')
+elif DMG_SHAPE == 'ellipse':
+    OUTPUT = os.path.join(
+        _VIDEO_DIR,
+        f'E-{XLDMG}x{YLDMG}_A-{np.degrees(PHIDMG):.0f}_X-{XDMG}_Y-{YDMG}.mp4')
+else:
+    OUTPUT = os.path.join(_VIDEO_DIR, f'D-{XLDMG}_X-{XDMG}_Y-{YDMG}.mp4')
 CMAP        = 'Spectral_r'  # diverging colourmap
 
 # Set to True to save the precomputed frame stack to disk as a .npz archive.
@@ -63,11 +98,12 @@ CMAP        = 'Spectral_r'  # diverging colourmap
 #   t_frames  — float64 (N_FRAMES,) time values [s] for each frame
 # Reload with: data = np.load(FRAMES_NPZ); z = data['z_frames']
 SAVE_FRAMES = False
-FRAMES_NPZ  = os.path.join(VIDEOS_DIR, 'z_frames.npz')
+FRAMES_NPZ  = os.path.join(_VIDEO_DIR, 'z_frames.npz')
 
 # ---------------------------------------------------------------------------
 # Plate bounds
 # ---------------------------------------------------------------------------
+L = 726.
 XMIN, XMAX = 0., L
 YMIN, YMAX = 0., L
 
@@ -109,36 +145,33 @@ def precompute_frames(
             if x_end <= x_start:
                 continue
 
-            # Sample positions centred in each grid cell along the segment
-            x_samples = np.arange(x_start + d_x / 2, x_end, d_x)
-            if x_samples.size == 0:
-                continue
-
-            # Segment-level constants (computed once per segment).
-            # RTWave_SHM's Ray only stores f0/a0/t0 at each segment start —
-            # it has no precomputed "dominant frequency" or "phase
-            # coefficient" fields, so we derive the per-mm step multipliers
-            # here ourselves, matching medium.fshift_dispersion() and
-            # medium.tl() exactly (geom/objects_2d.py):
-            #   fshift_dispersion: f_d = exp(-1j*2*pi*fft_freq*x/fft_speed)*f0
-            #   tl:                a_d = a0 * exp(-2*pi*f_dom*xi*(t-t0))
-            #                      with f_dom = fft_freq[argmax(|freq[i]|)]
-            # This assumes a dispersive medium (medium(..., dispersive=True),
-            # the default and what gen_MUSE_dmg always builds); for a
-            # non-dispersive medium these step multipliers would not match
-            # medium.fshift_nd().
+            # Segment-level constants (computed once per segment)
             f0           = ray.freq[seg_idx]
             a0           = ray.a[seg_idx]
             t0           = ray.int_times[seg_idx]
             x0           = ray.x[seg_idx]
             v            = ray.medium.v_ray(ray, seg_idx)
-            dom_freq     = ray.fft_freq[np.argmax(np.abs(f0))]
-            phase_coeff  = -1j * 2 * np.pi * ray.fft_freq / ray.fft_speed  # [nfft], per mm
-            damping_rate = 2.0 * np.pi * dom_freq * ray.medium.xi / v      # scalar, per mm
 
-            # Step-recurrence initialisaton — advance phase/amp by d_x each step
+            # Sample positions on a GLOBAL time lattice (spacing d_x / v) rather
+            # than every d_x from the segment start: rays split at a wall (e.g.
+            # a transparent internal wall) then sample exactly the same points
+            # as the unsplit ray, so wavefields of different meshes can be
+            # compared cell by cell without binning speckle.
+            dt_s      = d_x / v
+            k0        = int(np.ceil((t0 + 1e-15) / dt_s))
+            t_samples = np.arange(k0, k0 + int((x_end - x_start) / d_x) + 2) * dt_s
+            x_samples = x0 + (t_samples - t0) * v
+            x_samples = x_samples[(x_samples > x_start) & (x_samples < x_end)]
+            if x_samples.size == 0:
+                continue
+            damping_rate = 2.0 * np.pi * ray._dom_freq * ray.medium.xi / v
+
+            # Step-recurrence initialisaton — advance phase/amp by d_x each step.
+            # Dispersion curve of THIS segment's direction (ray._phase_coeff
+            # only describes the last segment when dispersion follows direction).
+            phase_coeff = ray.phase_coeff_at(seg_idx)
             dx_first   = x_samples[0] - x0
-            step_phase = np.exp(phase_coeff * d_x)                # [nfft] complex
+            step_phase = np.exp(phase_coeff * d_x)               # [nfft] complex
             step_amp   = float(np.exp(-damping_rate * d_x))      # scalar
             cur_f      = np.exp(phase_coeff * dx_first) * f0
             cur_amp    = float(a0 * np.exp(-damping_rate * dx_first))
@@ -166,9 +199,10 @@ def precompute_frames(
 def draw_overlay(ax: plt.Axes, ray_map) -> None:
     """Draw damage walls, invisible mesh walls, and PZT sensor circles.
 
-    * Blue segments  → damage walls, rendered in dodgerblue.
-    * White segments → invisible internal mesh walls, rendered as thin
-                       dashed white lines (alpha=0.35) so the mesh
+    * Blue segments / ellipse → damage boundary, rendered in red.
+    * White segments → invisible internal mesh walls (including the
+                       transparent cell around an elliptical damage),
+                       rendered as thin dashed black lines so the mesh
                        structure is visible without dominating the wavefield.
     * Plate boundary (black) segments are skipped.
 
@@ -179,20 +213,29 @@ def draw_overlay(ax: plt.Axes, ray_map) -> None:
 
     for med in ray_map.mediums.values():
         for obj in med.objs:
-            if not isinstance(obj, Segment) or id(obj) in seen:
+            if not isinstance(obj, (Segment, Ellipse)) or id(obj) in seen:
                 continue
             seen.add(id(obj))
-            if obj.color == 'blue':
-                obj.plot(ax, color='dodgerblue')
+            if isinstance(obj, Ellipse):
+                obj.plot(ax, color='red')
+                for patch in ax.patches[-1:]:
+                    patch.set_linewidth(2.)
+                    patch.set_zorder(4)
+            elif obj.color == 'blue':
+                obj.plot(ax, color='red')
             elif obj.color == 'white':
                 ax.plot(
                     [obj.a1[0], obj.a2[0]],
                     [obj.a1[1], obj.a2[1]],
                     color='black', alpha=1.,
-                    linewidth=2., linestyle='-',
+                    linewidth=2., linestyle='--',
                 )
         for sens in med.sensors:
-            sens.plot(ax, color='white', marker='o')
+            center = sens.origin()
+            r = sens.bounds[0].r
+            ax.add_patch(
+                plt.Circle(center, r * 1.3, color='black', fill=True, zorder=3)
+            )
 
 
 def save_frames(z_frames: np.ndarray, t: np.ndarray,
@@ -215,7 +258,7 @@ def save_frames(z_frames: np.ndarray, t: np.ndarray,
         t_frames=t[frame_t_indices],
     )
     print(f'Frame stack saved -> {FRAMES_NPZ}')
-    print(f'  shape : {z_frames.shape}  (N_FRAMES × ngridx × ngridy)')
+    print(f'  shape : {z_frames.shape}  (N_FRAMES x ngridx x ngridy)')
     print(f'  dtype : {z_frames.dtype}')
     print(f'  reload: np.load("{FRAMES_NPZ}")["z_frames"]')
 
@@ -230,8 +273,12 @@ def make_video(z_frames: np.ndarray, t: np.ndarray,
     if lvl_lim == 0.:
         lvl_lim = 1.
 
-    fig, ax = plt.subplots(figsize=(8, 8), facecolor='#111111')
-    ax.set_facecolor('#111111')
+    fig, ax = plt.subplots(figsize=(9, 8), facecolor='white')
+    ax.set_facecolor('white')
+    # Reserve extra right-hand margin so the (larger) colorbar label isn't
+    # clipped by the figure edge — subplots() default margins were sized
+    # for the smaller fontsize this figure used to use.
+    fig.subplots_adjust(left=0.09, right=0.86, bottom=0.08, top=0.95)
 
     # Initial imshow — shape must be (ngridy, ngridx) for correct x/y axes
     im = ax.imshow(
@@ -245,31 +292,24 @@ def make_video(z_frames: np.ndarray, t: np.ndarray,
     )
 
     cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_label('Amplitude [a.u.]', color='white')
-    cbar.ax.yaxis.set_tick_params(color='white')
-    plt.setp(cbar.ax.yaxis.get_ticklabels(), color='white')
+    cbar.set_label(r'\textit{Amplitude} [a.u.]', color='black')
+    cbar.ax.yaxis.set_tick_params(color='black')
+    plt.setp(cbar.ax.yaxis.get_ticklabels(), color='black')
 
     # Static overlay: damage square + sensor circles (drawn once, on top)
     draw_overlay(ax, ray_map)
 
     ax.set_xlim(XMIN, XMAX)
     ax.set_ylim(YMIN, YMAX)
-    ax.set_xlabel('x [mm]', color='white')
-    ax.set_ylabel('y [mm]', color='white')
-    ax.tick_params(colors='white')
+    ax.set_xlabel(r'\textit{X} [mm]', color='black')
+    ax.set_ylabel(r'\textit{Y} [mm]', color='black')
+    ax.tick_params(colors='black')
     for spine in ax.spines.values():
-        spine.set_edgecolor('white')
-
-    title = ax.set_title('', color='white', fontsize=11, pad=8)
+        spine.set_edgecolor('black')
 
     def update(fi: int):
         im.set_data(z_frames[fi].T)
-        t_us = t[frame_t_indices[fi]] * 1.e6
-        title.set_text(
-            f'GLW propagation  —  S0 + A0  —  t = {t_us:.1f} µs\n'
-            f'AS4/8552 (+45,−45,90,0)  |  f = {F/1e3:.0f} kHz'
-        )
-        return [im, title]
+        return [im]
 
     ani = animation.FuncAnimation(
         fig, update,
@@ -286,13 +326,12 @@ def make_video(z_frames: np.ndarray, t: np.ndarray,
             extra_args=['-vcodec', 'libx264', '-pix_fmt', 'yuv420p'],
         )
         ani.save(OUTPUT, writer=writer, dpi=120)
+        print(f'MP4 saved -> {OUTPUT}')
     except Exception as e:
         print(f'ffmpeg not available ({e}). Falling back to GIF...')
         gif_path = OUTPUT.replace('.mp4', '.gif')
         ani.save(gif_path, writer='pillow', fps=FPS, dpi=80)
         print(f'GIF saved  -> {gif_path}')
-    else:
-        print(f'MP4 saved -> {OUTPUT}')
 
     plt.close(fig)
 
@@ -304,23 +343,19 @@ if __name__ == '__main__':
 
     # 1 — Build geometry
     print('Building geometry...')
-    m, pzts = gen_MUSE_dmg(
-        xdmg=XDMG, ydmg=YDMG, xldmg=XLDMG, yldmg=YLDMG,
-        thdmg=THDMG, rdmg=RDMG, bldmg=BLDMG, rmdmg=RMDMG,
-    )
-    # m, pzts = gen_MUSE_dmg(
-    #     xdmg=XDMG, ydmg=YDMG, xldmg=XLDMG, yldmg=YLDMG,
-    #     thdmg=1.288,   # intact plate thickness (no local thinning)
-    #     rdmg=0.0,      # damage walls fully transparent (no reflection)
-    #     bldmg=0.0,     # no boundary losses at damage walls
-    #     rmdmg=1.0,     # no mode conversion at damage walls
-    #     xi_dmg=1.e-3,  # same damping as surrounding plate
-    # )
+    if UNDAMAGED:
+        m, pzts = gen_MUSE_intact()
+    else:
+        m, pzts = gen_MUSE_dmg(
+            xdmg=XDMG, ydmg=YDMG, xldmg=XLDMG, yldmg=YLDMG,
+            thdmg=THDMG, rdmg=RDMG, bldmg=BLDMG, rmdmg=RMDMG,
+            shape=DMG_SHAPE, phidmg=PHIDMG,
+        )
 
     # 2 — Initial beam  (both S0 and A0)
     print(f'Emitting beam from PZT{SOURCE_IDX + 1} ({NRAYS} rays, S0+A0)...')
     ibeam = Beam_from_pzt(
-        NRAYS, pzts[SOURCE_IDX], power=NRAYS / len(pzts),
+        NRAYS, pzts[SOURCE_IDX], power=2001 / 8,
         f=F, npeaks=3, nfft=500, t=T,
     )
     m.set_init_beam(ibeam)

@@ -367,24 +367,31 @@ class Map2D:
                     h5f[key].attrs['columns'] = sensors_l
 
     def add_sensor(self, sens):
-        """Register a sensor in the first medium whose bounding box fully contains it.
+        """Register a sensor in the medium with the smallest bounding box that
+        fully contains it.
 
         Full containment is required: a sensor cut by a medium boundary would
         only see the rays of the medium it is registered in, and its
         integration chords would extend past the point where those rays are
-        truncated at the boundary.
+        truncated at the boundary.  The smallest box wins so that a sensor
+        lying inside a hole of a larger medium (e.g. inside the damage of a
+        plate) is registered in the inner medium.
         """
         xmax_s, xmin_s, ymax_s, ymin_s = sens.get_limits()
 
-        for i, m in self.mediums.items():
+        best, best_area = None, None
+        for m in self.mediums.values():
             xmax_m, xmin_m, ymax_m, ymin_m = m.get_limits()
             if xmax_m > xmax_s and xmin_m < xmin_s and ymax_m > ymax_s and ymin_m < ymin_s:
-                # The sensor is only added to the first medium that matches
-                m.add_objs([sens, ])
-                if hasattr(sens, 'map'):
-                    sens.map = self
-                self.sensors.append(sens)
-                return
+                area = (xmax_m - xmin_m) * (ymax_m - ymin_m)
+                if best is None or area < best_area:
+                    best, best_area = m, area
+        if best is not None:
+            best.add_objs([sens, ])
+            if hasattr(sens, 'map'):
+                sens.map = self
+            self.sensors.append(sens)
+            return
         raise KeyError('Unable to add sensor {}: bounding box x=[{:.2f}, {:.2f}], '
                        'y=[{:.2f}, {:.2f}] is not fully inside any medium'.format(
                            getattr(sens, 'name', sens), xmin_s, xmax_s, ymin_s, ymax_s))

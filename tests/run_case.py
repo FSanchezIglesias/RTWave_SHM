@@ -9,6 +9,7 @@ Usage::
     python tests/run_case.py --code-dir <dir with geom/ RayTracing/ utils_rays/>
                              --out <file.hdf5> [--case dmg|intact] [--nrays N]
                              [--nt N] [--tmax s] [--nfft N] [--source i]
+                             [--mesh holes|cells] [--shape rect|ellipse]
 """
 import argparse
 import json
@@ -36,6 +37,12 @@ def main() -> None:
     ap.add_argument('--xdmg', type=float, default=355.)
     ap.add_argument('--ydmg', type=float, default=99.)
     ap.add_argument('--log', default=None)
+    ap.add_argument('--mesh', default='holes', choices=['holes', 'cells'],
+                    help="gen_MUSE_dmg mesh: 'holes' (2 mediums) or the legacy"
+                         " convex-cell mesh with invisible walls")
+    ap.add_argument('--shape', default='rect', choices=['rect', 'ellipse'])
+    ap.add_argument('--phidmg', type=float, default=0.,
+                    help='ellipse rotation [rad] (shape=ellipse only)')
     ap.add_argument('--birth-direction-dispersion', action='store_true',
                     help='keep the birth-direction dispersion curve after reflections '
                          '(v1 behaviour); sets RayTracing.Ray.dispersion_follows_direction=False')
@@ -66,7 +73,8 @@ def main() -> None:
     t = np.linspace(0., args.tmax, args.nt)
     if args.case == 'dmg':
         m, pzts = gen_MUSE_dmg(xdmg=args.xdmg, ydmg=args.ydmg, xldmg=XLDMG, yldmg=YLDMG,
-                               thdmg=THDMG, rdmg=RDMG, bldmg=BLDMG, rmdmg=RMDMG)
+                               thdmg=THDMG, rdmg=RDMG, bldmg=BLDMG, rmdmg=RMDMG,
+                               shape=args.shape, phidmg=args.phidmg, mesh=args.mesh)
         key = 'DMG12_{:.2f}_{:.2f}/PZT{}'.format(args.xdmg, args.ydmg, args.source + 1)
     else:
         m, pzts = gen_MUSE_intact()
@@ -90,6 +98,7 @@ def main() -> None:
     m.close_h5()
 
     print(json.dumps({'code_dir': os.path.abspath(args.code_dir), 'key': key,
+                      'mesh': args.mesh, 'n_mediums': len(m.mediums),
                       'n_rays_traced': len(m.rays_h),
                       't_calc_t': t1 - t0, 't_calc_signal': t2 - t1,
                       't_total': t2 - t0}))

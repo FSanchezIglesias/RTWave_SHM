@@ -194,3 +194,33 @@
             \paragraph*{End-to-end validation.}
             %
             The final solver was compared with the original implementation (with the same unit-amplitude burst) on the benchmark case of Table~\ref{tab:opt_results} ($N = 2001$, 10\,000 samples, $N_{\rm fft} = 500$). With \texttt{dispersion\_follows\_direction} disabled, i.e.\ with the physics of the original solver, the \acrshort{nrmse} over all sensors is $5.0\times10^{-9}$ (absolute RMSE $8.2\times10^{-11}$), and $3\times10^{-12}$ in the direct-arrival window (20--\SI{50}{\micro\second}) of the nearest sensor, which contains no reflected rays. The residual is fully accounted for by the $10^{-8}$~mm boundary offset introduced with Step~1a ($\sim 4\times10^{-9}$~rad of phase per reflection), which was not yet present when Table~\ref{tab:opt_results} was compiled. With the direction-dependent dispersion enabled the \acrshort{nrmse} rises to $0.15$, entirely due to the reflected arrivals: the direct-arrival windows of the two sensors closest to the source change by $2.3\times10^{-4}$ and $2.4\times10^{-3}$ only. On the workstation used for this validation the original implementation with compiled wave-speed tables (Python geometry, on-disk ray store) required \SI{166.5}{\second} and the final solver \SI{2.4}{\second} (\SI{1.55}{\second} tracing, \SI{0.86}{\second} signal reconstruction) for the same case. The comparison script (\texttt{tests/compare\_v1\_v2.py}) and a unit test of the chord integration semantics (\texttt{tests/test\_signal\_on\_ray.py}) are distributed with the library.
+
+
+        \subsubsection{Further Exact Optimizations}
+        \label{ssec:opt_stage3}
+
+            Two additional modifications were applied to the validated solver. Both are exact reformulations; they were measured on the workstation of Section~\ref{ssec:opt_consistency} (best of three runs of the benchmark case, direction-dependent dispersion enabled) and checked against the output of the solver before the modification and, with the direction-dependent dispersion disabled, against the original implementation (Table~\ref{tab:opt_stage3}).
+
+            \paragraph*{Step~15: One inverse transform per chord run.}
+            %
+            After Step~14 the chord integration still performed one $N_t$-point inverse \acrshort{fft} per integration point, because each point is masked to zero before its own arrival time $t_k/2$. The inverse transform is linear and every mask is a prefix zeroing with a non-decreasing index $m_k$ along the chord. Grouping the points by mask index into spectra $\mathbf{S}_g$ and defining the cumulative spectra $\mathbf{C}_g = \sum_{g' \le g} \mathbf{S}_{g'}$, output sample $n$ equals $\mathrm{IFFT}(\mathbf{C}_{j(n)})[n]$ with $j(n) = \max\{g : m_g \le n\}$. Samples beyond the last mask index are therefore given by a single inverse transform of $\mathbf{C}_{G-1}$, samples before the first mask index are zero, and the samples in between, a transition window of a few dozen samples, are evaluated directly from the $N_{\rm fft}$-term inverse-\acrshort{dft} sum of the corresponding $\mathbf{C}_{j(n)}$. This replaces $\sim 17\,000$ transforms of $10^4$ points per source by $273$ (one per chord run) at the cost of $\sim 3\times10^{4}$ complex multiply--adds per run. The signal reconstruction time falls from \SI{0.86}{\second} to \SI{0.20}{\second}. A first attempt that only batched the grouped transforms did not pay off (the cost of a $10^4$-point transform is the same inside a batch), which is why the direct evaluation of the transition window is essential.
+
+            \paragraph*{Step~16: Direct kernel calls and byte-based hashing.}
+            %
+            Every trace step tests the ray segment against all boundaries of its medium and all sensors. The Python wrappers around the compiled intersection kernels converted their four inputs with \texttt{np.asarray} on every call and post-processed the result; \texttt{Segment} and \texttt{Circunf} now store contiguous double-precision copies of their geometry at construction, \texttt{Ray} guarantees the same for its trace points, and \texttt{Segment.intersect} and the sensor boundaries call the kernels directly. The per-ray hash of Step~4 built Python tuples from the $N_{\rm fft}$-element spectrum; it now hashes the raw array bytes. Tracing time falls from \SI{1.57}{\second} to \SI{1.26}{\second}.
+
+            \begin{table}[htbp]
+                \centering
+                \caption{Exact optimizations applied after the validation of Section~\ref{ssec:opt_consistency} (same benchmark case; review workstation, best of three runs). ``vs.\ previous'' is the \acrshort{nrmse} with respect to the solver output before the step; ``vs.\ original'' is the \acrshort{nrmse} with respect to the original implementation with the direction-dependent dispersion disabled.}
+                \label{tab:opt_stage3}
+                \small
+                \begin{tabular}{@{}clS[table-format=1.2]S[table-format=1.2]S[table-format=1.2]S[table-format=1.2]cc@{}}
+                    \toprule
+                    {Step} & {Optimization} & {Tracing (s)} & {Signal (s)} & {Total (s)} & {Incr.\ ($\times$)} & {NRMSE vs.\ previous} & {NRMSE vs.\ original} \\
+                    \midrule
+                    14 & Validated solver (baseline)          & 1.57 & 0.86 & 2.43 & {---} & {---}                & $5.0\times10^{-9}$ \\
+                    15 & One inverse transform per chord run  & 1.50 & 0.20 & 1.70 & 1.42  & $2.3\times10^{-16}$ & $5.0\times10^{-9}$ \\
+                    16 & Direct kernel calls, byte hashing    & 1.26 & 0.19 & 1.45 & 1.17  & $2.3\times10^{-16}$ & $5.0\times10^{-9}$ \\
+                    \bottomrule
+                \end{tabular}
+            \end{table}

@@ -1,42 +1,52 @@
-from geom.objects_2d import Segment, Circunf
-from geom.geom_utils import seg_seg_intersect_2d, circunf_seg_intersect_2d, dot_2d
+from geom.objects_2d import Segment, Circunf, _SEG_TOL
+from geom.geom_utils import (dot_2d, _seg_seg_intersect_2d_numba,
+                             _circunf_seg_intersect_2d_numba)
 import numpy as np
 from scipy.fft import irfft
 from scipy.signal.windows import hamming
 import logging
 
+_CIRC_TANGENT_TOL = 1.e-9
+
 
 class _StrBoundary(Segment):
-    def intersect_sens(self, ray):
-        intersect = seg_seg_intersect_2d(ray.trace_points[-2], ray.trace_points[-1], self.a1, self.a2)
-        if intersect is None:
+    def intersect_sens(self, ray, p1=None):
+        # direct kernel call (trace points and endpoints are float64 arrays)
+        p0 = ray.trace_points[-2]
+        if p1 is None:
+            p1 = ray.trace_points[-1]
+        intersect = _seg_seg_intersect_2d_numba(p0, p1,
+                                                self._a1, self._a2, _SEG_TOL)
+        if intersect[0] != intersect[0]:  # NaN -> no intersection
             return None
 
         # t_int = norm_2d(intersect - ray.trace[-2]) /
         # norm_2d(ray.trace[-1] - ray.trace[-2]) * (t - ray.int_times[-2]) \
         #         + ray.int_times[-2]
-        x_int = ray.x[-2] + dot_2d(intersect - ray.trace_points[-2], ray.d[-2])
+        x_int = ray.x[-2] + dot_2d(intersect - p0, ray.d[-2])
 
         return [x_int, ]  # return as a list for compatibility
 
 
 class _CircBoundary(Circunf):
-    def intersect_sens(self, ray):
-
-        intersect = circunf_seg_intersect_2d(self.c, self.r, ray.trace_points[-2], ray.trace_points[-1])
-        if not intersect:
+    def intersect_sens(self, ray, p1=None):
+        # direct kernel call; returns an (n, 2) array with n in {0, 1, 2}
+        p0 = ray.trace_points[-2]
+        if p1 is None:
+            p1 = ray.trace_points[-1]
+        intersect = _circunf_seg_intersect_2d_numba(self._c, self._r, p0, p1,
+                                                    False, _CIRC_TANGENT_TOL)
+        if intersect.shape[0] == 0:
             return None
 
         # t_int = norm_2d(intersect - ray.trace[-2]) / norm_2d(ray.trace[-1] - ray.trace[-2]) *
         # (t - ray.int_times[-2]) \
         #         + ray.int_times[-2]
-        x_int = []
+        d0 = ray.d[-2]
+        x0 = ray.x[-2]
 
         # Distance travelled over ray
-        for i in intersect:
-            x_int.append(ray.x[-2] + dot_2d(i - ray.trace_points[-2], ray.d[-2]))
-
-        return x_int
+        return [x0 + dot_2d(intersect[i] - p0, d0) for i in range(intersect.shape[0])]
 
 
 class Sensor:
@@ -104,16 +114,20 @@ class Sensor:
 
         self.signal_s = None
 
-    def intersect(self, ray, t, h5file):
+    def intersect(self, ray, t, h5file, p1=None):
         """ Checks for intersections but rays are not altered
         :param ray: Ray object
         :param t: maintains sig of other intersect methods
         :param h5file: maintains sig of other intersect methods
+        :param p1: end point of the trace to check (default: the ray's last
+            trace point).  ``Ray.trace`` passes the point where the trace hits
+            the nearest boundary so that the overshooting part of the trace
+            (beyond the wall the ray reflects/refracts on) records no crossing.
         :return: empty list
         """
 
         for b in self.bounds:
-            int_points = b.intersect_sens(ray)
+            int_points = b.intersect_sens(ray, p1)
             if int_points is not None:
                 if ray.__hash__() in self.int_rays.keys():
                     for xi in int_points:
@@ -226,12 +240,58 @@ class Sensor:
         cur_f = np.exp(phase_coeff * dx_k[0]) * f0           # [n_fft]
         cur_amp = a0 * np.exp(-damping_rate * dx_k[0])       # scalar
 
-        for k in range(xi.size):
-            s = cur_amp * w_dx[k] * irfft(cur_f, n=n_t)
-            s[:mask_idx[k]] = 0
-            total += s
+        # --- Exact reformulation of  sum_k mask_k( irfft(F_k) )  ---
+        # The inverse FFT is linear and every mask is a prefix zeroing whose
+        # index m_k is non-decreasing along the run.  Grouping points with the
+        # same mask index (spectra S_g, masks m_g) and defining the cumulative
+        # spectra C_g = S_0 + ... + S_g, the output sample n equals
+        # irfft(C_{j(n)})[n] with j(n) = max{g : m_g <= n}.  Hence:
+        #   * n <  m_0        -> 0
+        #   * n >= m_{G-1}    -> irfft(C_{G-1})[n]      (one full transform)
+        #   * m_0 <= n < m_{G-1} -> direct inverse-DFT evaluation of C_{j(n)}
+        #                          at that single sample (n_fft terms each).
+        # The transition window is only a few dozen samples long, so this
+        # replaces one 10^4-point transform per point by one per run.
+        n_pts = xi.size
+        group_spectra = []
+        group_masks = []
+        acc = cur_amp * w_dx[0] * cur_f
+        cur_mask = int(mask_idx[0])
+        for k in range(1, n_pts):
             cur_f *= step_phase      # n_fft complex mults, no exp
             cur_amp *= step_amp      # 1 scalar mult
+            if mask_idx[k] != cur_mask:
+                group_spectra.append(acc)
+                group_masks.append(cur_mask)
+                acc = cur_amp * w_dx[k] * cur_f
+                cur_mask = int(mask_idx[k])
+            else:
+                acc += cur_amp * w_dx[k] * cur_f
+        group_spectra.append(acc)
+        group_masks.append(cur_mask)
+
+        cum = np.cumsum(np.array(group_spectra), axis=0)     # [n_groups, n_fft]
+        m_first, m_last = group_masks[0], group_masks[-1]
+
+        # Full transform of the total spectrum, valid from the last mask on
+        full = irfft(cum[-1], n=n_t)
+        if m_last < n_t:
+            total[m_last:] += full[m_last:]
+
+        # Transition window: direct evaluation of irfft(C_{j(n)})[n]
+        if m_last > m_first:
+            n_win = np.arange(m_first, min(m_last, n_t))
+            masks = np.asarray(group_masks)
+            j_of_n = np.searchsorted(masks, n_win, side='right') - 1
+            n_fft = cum.shape[1]
+            kbins = np.arange(n_fft)
+            # scipy.fft.irfft convention: y[n] = (1/N) [Re x_0 + 2 sum_{k>=1} Re(x_k e^{+2 pi i k n / N})]
+            # (bins beyond n_fft are zero; n_fft < N/2 so there is no Nyquist term)
+            phase = np.exp((2j * np.pi / n_t) * np.outer(n_win, kbins))   # [n_win, n_fft]
+            weights = np.full(n_fft, 2.0)
+            weights[0] = 1.0
+            vals = (cum[j_of_n] * phase * weights).real.sum(axis=1) / n_t
+            total[n_win] += vals
 
     def signal(self, d_x=0.1, procs=None, window='hsphere'):
         """ Measure signal at sensor
