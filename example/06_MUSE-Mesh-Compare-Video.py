@@ -34,6 +34,11 @@ import plot_wave_video as pwv
 from plot_wave_video import precompute_frames, draw_overlay, XMIN, XMAX, YMIN, YMAX
 from MUSE_dmg import gen_MUSE_dmg
 from RayTracing.Ray import Beam_from_pzt
+import RayTracing.Ray as _ray_mod
+
+# mesh-equivalence video: the cell mesh has no diffracting vertices (its
+# corners are shared by 3+ walls), so compare both meshes without diffraction
+_ray_mod.diffraction = False
 
 # ---------------------------------------------------------------------------
 # Simulation parameters

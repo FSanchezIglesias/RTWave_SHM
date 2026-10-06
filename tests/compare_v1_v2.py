@@ -35,6 +35,7 @@ def run(code_dir: str, out: str, args: argparse.Namespace, log: str,
            '--nrays', str(args.nrays), '--nt', str(args.nt), '--tmax', str(args.tmax),
            '--nfft', str(args.nfft), '--source', str(args.source), '--log', log,
            '--mesh', 'cells',  # v1 interacts with the first crossed wall: needs convex cells
+           '--v1-physics',  # v1: no corner diffraction, energy lost at total internal reflection
            *extra]
     res = subprocess.run(cmd, cwd=_REPO_ROOT, capture_output=True, text=True)
     if res.returncode != 0:

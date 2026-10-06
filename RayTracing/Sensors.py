@@ -223,6 +223,8 @@ class Sensor:
         ``exp(alpha*(dx + d_x)) = exp(alpha*dx) * exp(alpha*d_x)``.
         """
         n_t = total.size
+        if ray.amp_law is not None:
+            w_dx = w_dx * ray.amp_factor(xi)   # diffracted ray: per-point amplitude law
         x0 = ray.x[seg_idx]
         f0 = ray.freq[seg_idx]
         a0 = ray.a[seg_idx]

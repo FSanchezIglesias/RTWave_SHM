@@ -1,10 +1,20 @@
-from geom.geom_utils import dot_2d, norm_2d
+from geom.geom_utils import dot_2d, norm_2d, cross_2d
 from RayTracing.Ray import Ray, a_tol
 import RayTracing.Ray as _ray_module  # for the ``dispersion_follows_direction`` switch
 from scipy.fft import rfftfreq
 import math
 import numpy as np
 import logging
+
+
+def _inherit_kwargs(ray):
+    """Diffraction bookkeeping a daughter spawned at ``ray``'s last event inherits."""
+    x_here = ray.x[-1]
+    law = ray.amp_law
+    if law is not None:
+        law = (law[0], law[1], law[2], law[3] + x_here)
+    return dict(x_src=ray.x_src + x_here, dtheta=ray.dtheta, amp_law=law,
+                diff_order=ray.diff_order)
 
 
 def ray_refl(ray, n, d, intersect, t_int, t,
@@ -73,7 +83,7 @@ def ray_refl(ray, n, d, intersect, t_int, t,
 
 
 def ray_refr(ray, n, d, intersect, t_int, t, rd, ra, rf,
-             ratio, m2, map, bl=0., ratio_mode=1.):
+             ratio, m2, map, bl=0., ratio_mode=1., v2_v1=None):
     """ Refracts ray
      Make sure to execute this always before the reflection!!!
 
@@ -91,7 +101,8 @@ def ray_refr(ray, n, d, intersect, t_int, t, rd, ra, rf,
     :param ratio_mode: ratio between symmetric and antisymmetric
     :param m2: material 2
     :param bl: boundary loss
-    :param objs: objects in the ray map
+    :param v2_v1: velocity ratio m2 / incident medium (computed with the
+        incident direction by ``_interact``); evaluated here if None
     :return: refracted rays, if any
     """
 
@@ -105,8 +116,9 @@ def ray_refr(ray, n, d, intersect, t_int, t, rd, ra, rf,
 
     # material impedance ratios thing for Snell's law v2/v1
     # TODO: maybe try to fix this for composite
-    v2_v1 = m2.v_ray(ray) / \
-            ray.medium.v_ray(ray)
+    if v2_v1 is None:
+        v2_v1 = m2.v_ray(ray) / \
+                ray.medium.v_ray(ray)
 
     irays = []
 
@@ -127,10 +139,12 @@ def ray_refr(ray, n, d, intersect, t_int, t, rd, ra, rf,
         epsilon = 1e-8
         intersect_safe = intersect + rfr_dir_norm * epsilon
 
+        inh = _inherit_kwargs(ray)
+
         if a_rfr > a_tol:
             # Generate refracted ray
             ray_refr = Ray(intersect_safe, rfr_dir_norm, freq=rf, medium=m2, t=ray.t, t0=t_int, kind=ray.kind,
-                           a=a_rfr, parent=ray, _fft_freq=ray.fft_freq)
+                           a=a_rfr, parent=ray, _fft_freq=ray.fft_freq, **inh)
 
             # mode_change must read ray_refr's INITIAL state, before .trace() mutates it
             if a_rfr_mc > a_tol:
@@ -147,7 +161,7 @@ def ray_refr(ray, n, d, intersect, t_int, t, rd, ra, rf,
         elif a_rfr_mc > a_tol:
             # Only the mode-changed refracted ray survives — still need a base ray for mode_change
             ray_refr = Ray(intersect_safe, rfr_dir_norm, freq=rf, medium=m2, t=ray.t, t0=t_int, kind=ray.kind,
-                           a=a_rfr, parent=ray, _fft_freq=ray.fft_freq)
+                           a=a_rfr, parent=ray, _fft_freq=ray.fft_freq, **inh)
             ray_refr_mc = mode_change(ray_refr, a_rfr_mc, parent=ray)
             irays.append(ray_refr_mc.__hash__())
             irays.extend(ray_refr_mc.trace(t, map))
@@ -246,9 +260,270 @@ def mode_change(ray, a_new, parent=None):
                  freq=ray.freq[-1].copy(),
                  medium=ray.medium, t=ray.t, t0=ray.int_times[-1],
                  kind='A0' if ray.kind == 'S0' else 'S0',
-                 a=a_new, parent=parent, _fft_freq=ray.fft_freq)
+                 a=a_new, parent=parent, _fft_freq=ray.fft_freq,
+                 **_inherit_kwargs(ray))
 
     return mc_ray
+
+
+_DIFF_SECTOR_MARGIN = 1.e-4   # [rad] keep fan rays off the faces of the vertex
+_DIFF_PROBE_EPS = 1.e-4       # [mm] offset of the probe rays from the vertex
+_DIFF_PROBE_AMIN = 1.e-3      # relative amplitude below which a probe branch is dropped
+_DIFF_PROBE_DEPTH = 6         # max number of wall interactions of a probe
+_DIFF_PROBE_LFAR = 1.e5       # [mm] probe trace length
+
+
+def _probe_families(vertex, med, p, d, a, F, fft_freq, kind, fi, depth, out):
+    """Trace a probe ray through the walls of ``vertex``'s obstacle.
+
+    Geometrical-optics only (same amplitude rules as ``ray_refl``/``ray_refr``,
+    no mode conversion), recursive over reflections and refractions.  The
+    spectrum ``F`` is dispersed along every leg with the medium's phase
+    coefficient (``medium.phase_coeff``), so families that travelled through
+    a slower/thicker region carry their delay and chirp.  Every branch that
+    leaves the obstacle is appended to ``out`` as
+    ``(medium, direction, amplitude, escape point, spectrum)``.
+    """
+    p1 = p + d * _DIFF_PROBE_LFAR
+    best = None
+    for w in vertex.walls:
+        h = w.hit(p, p1)
+        if h is not None and (best is None or h[0] < best[0][0]):
+            best = (h, w)
+    if best is None or depth == 0:
+        out.append((med, d, a, p, F))
+        return
+    from RayTracing.Ray import total_internal_reflection
+    (s_hit, q, n, dt), w = best
+    F_q = np.exp(med.phase_coeff(kind, fft_freq, d) * s_hit) * F
+    R = w.ratio_rfl * w.ratio_mode * (1. - w.bl)
+    T = (1. - w.ratio_rfl) * w.ratio_mode * (1. - w.bl)
+    d_t = None
+    if len(w.mediums) == 2:
+        m2 = w.mediums[1] if w.mediums[0] is med else w.mediums[0]
+        v2_v1 = m2.v_dir(kind, fi, d) / med.v_dir(kind, fi, d)
+        sin_t = v2_v1 * dot_2d(d, dt)
+        if abs(sin_t) <= 1.:
+            d_t = math.cos(math.asin(sin_t)) * n + sin_t * dt
+            d_t = d_t / norm_2d(d_t)
+        elif total_internal_reflection:
+            R = R + T      # same rule as _interact: the transmitted share reflects
+    d_r = d - 2. * dot_2d(d, n) * n
+    if a * R > _DIFF_PROBE_AMIN:
+        _probe_families(vertex, med, q + 1.e-8 * d_r, d_r, a * R, F_q, fft_freq, kind, fi,
+                        depth - 1, out)
+    if d_t is not None and a * T > _DIFF_PROBE_AMIN:
+        _probe_families(vertex, m2, q + 1.e-8 * d_t, d_t, a * T, F_q, fft_freq, kind, fi,
+                        depth - 1, out)
+
+
+def _fan_angles(s0, phi0, max_angle, s_max):
+    """Angles ``(dphi, spacing)`` of a diffracted fan around its boundary.
+
+    Rays are spaced ``s0`` within ``phi0`` of the boundary, where the Fresnel
+    transition varies fastest, and the spacing then grows linearly with the
+    angle (the far diffracted field only decays like 1/angle) up to ``s_max``
+    (so that a sensor still sees several fan rays), out to ``max_angle`` on
+    both sides.
+    """
+    out = []
+    e = 0.
+    while e < max_angle:
+        s = min(s_max, s0 * max(1., e / phi0))
+        c = e + 0.5 * s
+        out.append((c, s))
+        out.append((-c, s))
+        e += s
+    return out
+
+
+def _point_in_walls(q, walls):
+    """Even-odd test of ``q`` against the closed polygon formed by ``walls``."""
+    inside = False
+    for w in walls:
+        a1, a2 = w._a1, w._a2
+        if (a1[1] > q[1]) != (a2[1] > q[1]):
+            x_int = a1[0] + (q[1] - a1[1]) / (a2[1] - a1[1]) * (a2[0] - a1[0])
+            if x_int > q[0]:
+                inside = not inside
+    return inside
+
+
+def _inner_medium(vertex):
+    """The medium enclosed by the obstacle walls of ``vertex`` (all of its
+    objects are walls of the obstacle), or None for an open obstacle."""
+    walls = set(id(w) for w in vertex.walls)
+    for med in vertex.mediums:
+        if med.objs and all(id(o) in walls for o in med.objs):
+            # closed only if every wall endpoint is shared by two walls
+            ends = []
+            for w in vertex.walls:
+                ends.extend([w._a1, w._a2])
+            for e in ends:
+                if sum(norm_2d(e - f) < 1.e-6 for f in ends) != 2:
+                    return None
+            return med
+    return None
+
+
+def ray_diff(ray, vertex, x_foot, t, map):
+    """Launch the diffracted ray fans of ``vertex`` excited by ``ray``.
+
+    ``ray`` is the representative of its family at the vertex (the one whose
+    trace passes within half a ray spacing of it, see ``Ray.trace``).  The
+    geometrical-optics (GO) field around the vertex is made of ray families
+    (the incident one, the ones reflected and transmitted by the faces, the
+    ones that entered next to the corner and left through the adjacent
+    face, ...) whose boundaries all pass through the vertex; the GO field
+    jumps across each boundary and edge diffraction is what keeps the
+    physical field continuous there.
+
+    The families are found numerically: two probe rays parallel to ``ray``
+    at +/- ``_DIFF_PROBE_EPS`` from the vertex are traced through the walls
+    of the obstacle (``_probe_families``), carrying the spectrum of ``ray``
+    dispersed along their legs; every outgoing family (medium, direction)
+    whose spectrum ``a * F`` differs between the two probes is a shadow
+    boundary, with the complex difference spectrum ``dF`` as its jump (a
+    family that crossed a slower region is delayed and chirped, so the jump
+    between it and the incident wave is not just an amplitude ratio).  A
+    transparent wall therefore produces no fan at all.
+
+    For each boundary a fan of rays is launched from the vertex around the
+    boundary direction, in the family's medium and restricted to the sector
+    that medium occupies at the vertex: spectrum ``dF/2`` (negative on the
+    side of the boundary where the GO field is larger, positive on the
+    other side, so that GO + fan is continuous), amplitude ``a_i`` scaled by
+    the fan/incident angular spacing ratio, times the UTD Fresnel
+    transition and the spreading law of ``Ray.amp_factor``.  Fans keep the incident mode (no mode conversion at the
+    edge), are spaced ``diff_params['dtheta_factor']`` times the incident
+    family and span ``diff_params['max_angle']`` on both sides of the
+    boundary.
+
+    :param x_foot: path position of ``ray`` at the vertex
+    :return: hashes of the rays spawned
+    """
+    from RayTracing.Ray import diff_params
+    irays = []
+    seg = len(ray.x) - 2  # the trace has already appended the segment end
+    x_i, trace_i, d_i, f_i, a_i, t_i = ray.calc_ray(i=seg, x=x_foot)
+    if not ray.alive:
+        return irays
+
+    V = vertex.p
+    m = ray.medium
+    fi = ray._dom_freq
+    p0 = ray.trace_points[seg]
+
+    # --- families on both sides of the vertex --------------------------
+    n_ccw = np.array([-d_i[1], d_i[0]])
+    off_line = cross_2d(d_i, p0 - V)          # offset of the ray's line from V
+    mid = 0.5 * (p0 + trace_i)                # a point of the trace inside m
+    x_mid = 0.5 * (ray.x[seg] + x_i)
+    f_mid = ray.calc_ray(i=seg, x=x_mid)[3]   # probe start spectrum
+    fft_freq = ray.fft_freq
+    idom = ray._dom_freq_idx
+    others = [mm for mm in vertex.mediums if mm is not m]
+    if len(others) > 1:
+        logging.warning('%r: more than two mediums, diffraction skipped', vertex)
+        return irays
+    m_in = _inner_medium(vertex) if others else None
+    fam = {}
+    for sgn in (1., -1.):
+        q = mid + (sgn * _DIFF_PROBE_EPS - off_line) * n_ccw
+        # medium of the probe start: a ray passing a convex corner from inside
+        # the obstacle has its outer probe outside it (and vice versa)
+        med0 = m
+        if m_in is not None:
+            med0 = m_in if _point_in_walls(q, vertex.walls) else                 (others[0] if m is m_in else m)
+        out = []
+        _probe_families(vertex, med0, q, d_i, 1., f_mid, fft_freq, ray.kind, fi,
+                        _DIFF_PROBE_DEPTH, out)
+        for med, d, a, pe, F in out:
+            # reference the spectrum to the vertex: propagate along the escape
+            # direction up to the foot of the vertex on the escape line, so
+            # that all families (and both probes) share the same reference
+            F = np.exp(med.phase_coeff(ray.kind, fft_freq, d) * dot_2d(V - pe, d)) * F
+            key = (id(med), round(math.atan2(d[1], d[0]), 9))
+            entry = fam.setdefault(key, [med, d, None, None, None, None])
+            if sgn > 0:
+                entry[2] = a * F
+                entry[4] = pe
+            else:
+                entry[3] = a * F
+                entry[5] = pe
+
+    # --- sectors of the media at the vertex ------------------------------
+    # (``mid`` is strictly inside m; the foot point may lie on a face)
+    _, _, _, a_start, extent = vertex.sector(mid - V)
+    sectors = {id(m): (a_start, extent)}
+    if others:
+        sectors[id(others[0])] = (a_start + extent, 2. * np.pi - extent)
+    if vertex.single_medium and extent < np.pi + 1.e-9:
+        return irays  # closed-boundary corner of a single medium: GO exact
+
+    dth_fan = diff_params['dtheta_factor'] * ray.dtheta
+    X = ray.x_src + x_i
+    two_pi = 2. * np.pi
+    angles = _fan_angles(dth_fan, diff_params['uniform_angle'], diff_params['max_angle'],
+                         max(dth_fan, diff_params['max_spacing']))
+
+    beam = getattr(map, 'init_beam', None)
+    a_min = diff_params['min_amp']
+    if beam is not None:
+        a_min = max(a_min, diff_params['min_rel_amp'] * beam.a0)
+    f_ref = abs(f_mid[idom])
+    for key, (med, u_b, F_p, F_m, pe_p, pe_m) in fam.items():
+        if F_p is None:
+            F_p = np.zeros_like(f_mid)
+        if F_m is None:
+            F_m = np.zeros_like(f_mid)
+        # complex jump spectrum, from the side where the family is stronger
+        # (the fan is -dF/2 on that side and +dF/2 on the other)
+        p_high = abs(F_p[idom]) > abs(F_m[idom])
+        dF = F_p - F_m if p_high else F_m - F_p
+        J = abs(dF[idom]) / f_ref          # jump at the dominant frequency
+        if J < diff_params['min_jump'] or 0.5 * J * a_i <= a_min:
+            continue
+        if id(med) not in sectors:
+            continue
+        a0, ext = sectors[id(med)]
+        # Side of the boundary line where the GO field is larger (the family
+        # exists): the family occupies the directions from its boundary, on
+        # that side, up to the face that bounds the medium's sector; beyond
+        # the face (e.g. behind a screen) it is absent although those
+        # directions are still on the same side of the boundary line.
+        pe_high = pe_p if p_high else pe_m
+        f_fan = 0.5 * dF
+        high = np.sign(cross_2d(u_b, pe_high - V))
+        if high == 0.:
+            continue
+        phi_b = math.atan2(u_b[1], u_b[0])
+        rel_b = (phi_b - a0) % two_pi
+        if rel_b > ext:  # boundary outside the sector: clamp to the nearer end
+            rel_b = ext if rel_b - ext < two_pi - rel_b else 0.
+        tag = '%d_%.6f' % (id(med) % 100000, phi_b)
+        for j, (dphi, s_k) in enumerate(angles):
+            phi = phi_b + dphi
+            rel = (phi - a0) % two_pi
+            if rel < _DIFF_SECTOR_MARGIN or rel > ext - _DIFF_SECTOR_MARGIN:
+                continue  # outside the medium's sector at the vertex
+            u = np.array([math.cos(phi), math.sin(phi)])
+            present = (rel > rel_b) if high > 0. else (rel < rel_b)
+            sgn = -1. if present else 1.
+            # amplitude proportional to the angular coverage of the ray so that
+            # the fan's field (amplitude x ray density) is independent of the
+            # non-uniform spacing
+            a_fan = a_i * s_k / ray.dtheta
+            rd = Ray(V + 1.e-8 * u, u, freq=sgn * f_fan, medium=med, t=ray.t, t0=t_i,
+                     kind=ray.kind, a=a_fan, parent=ray, _fft_freq=ray.fft_freq,
+                     x_src=0., dtheta=s_k, diff_order=ray.diff_order + 1,
+                     _hash_extra=(tag, j))
+            k = two_pi * fi / med.v_ray(rd)
+            rd.amp_law = (X, dphi, k, 0.)
+            irays.append(rd.__hash__())
+            irays.extend(rd.trace(t, map))
+
+    return irays
 
 
 def split_ray(ray, t_ind,
@@ -279,7 +554,7 @@ def split_ray(ray, t_ind,
         # zi = np.argmin(np.abs(x_axis-tr[0]))
         # zk = np.argmin(np.abs(y_axis-tr[1]))
 
-        s = ray.signal_at_i(i)
+        s = ray.signal_at_i(i)  # includes amp_factor for diffracted rays
         if (zi < ngridx) and (zk < ngridy):
             z_ray[zi, zk] += s[t_ind]  # if np.abs(s[t_ind]) > max(
             #    np.abs(s)) * err_val else 0.  # r.a[i]*irfft(r.freq[i], n=len(r.t))[t_ind]
@@ -320,6 +595,11 @@ def save_ray(ray, h5file, ray_group='rays'):
         dset.attrs['parent'] = ray.parent  # .__hash__()
         # dset.attrs['fftf'] = ray.fft_freq
         dset.attrs['alive'] = ray.alive
+        dset.attrs['x_src'] = ray.x_src
+        dset.attrs['dtheta'] = ray.dtheta
+        dset.attrs['diff_order'] = ray.diff_order
+        if ray.amp_law is not None:
+            dset.attrs['amp_law'] = np.asarray(ray.amp_law, dtype=float)
 
     except ValueError:
         # Grows the dataset
@@ -377,6 +657,14 @@ def load_ray(rhash, h5file, rmap, ray_group='rays'):
         # Restore cached hash
         ray._hash = rhash
 
+        # Diffraction bookkeeping (absent in files written before it existed)
+        ray.x_src = float(dset.attrs.get('x_src', 0.))
+        ray.dtheta = float(dset.attrs.get('dtheta', 0.))
+        ray.diff_order = int(dset.attrs.get('diff_order', 0))
+        law = dset.attrs.get('amp_law', None)
+        ray.amp_law = None if law is None else tuple(float(v) for v in law)
+        ray._vseen = None
+
         # Dominant frequency — invariant (fshift only rotates phases)
         ray._dom_freq_idx = np.argmax(np.abs(freq[0]))
         ray._dom_freq = ray.fft_freq[ray._dom_freq_idx]
@@ -402,5 +690,10 @@ def load_ray(rhash, h5file, rmap, ray_group='rays'):
         ray._dom_freq_idx = 0
         ray._dom_freq = 0.
         ray._phase_coeff = np.zeros(1, dtype=np.complex128)
+        ray.x_src = 0.
+        ray.dtheta = 0.
+        ray.diff_order = 0
+        ray.amp_law = None
+        ray._vseen = None
 
     return ray

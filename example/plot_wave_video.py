@@ -175,19 +175,42 @@ def precompute_frames(
             step_amp   = float(np.exp(-damping_rate * d_x))      # scalar
             cur_f      = np.exp(phase_coeff * dx_first) * f0
             cur_amp    = float(a0 * np.exp(-damping_rate * dx_first))
+            # diffracted rays carry a per-point amplitude law (Ray.amp_factor)
+            g_samples  = ray.amp_factor(x_samples) if ray.amp_law is not None else None
 
-            for x_s in x_samples:
+            d_seg  = ray.d[seg_idx]
+            n_perp = np.array([-d_seg[1], d_seg[0]])
+
+            for k_s, x_s in enumerate(x_samples):
                 dx_k   = x_s - x0
-                pos    = ray.trace_points[seg_idx] + ray.d[seg_idx] * dx_k
-                zi, zk = _grid_index(pos, XMIN, XMAX, ngridx, YMIN, YMAX, ngridy)
-
-                if 0 <= zi < ngridx and 0 <= zk < ngridy:
-                    t_s  = t0 + dx_k / v
-                    s    = cur_amp * irfft(cur_f, n=n_t)
-                    # causality mask (t/2 accounts for dispersion smearing,
-                    # matching the convention in Ray.signal_at_x)
-                    s[:np.searchsorted(t_vec, t_s / 2)] = 0.0
-                    z_frames[:, zi, zk] += s[frame_t_indices].astype(np.float32)
+                pos    = ray.trace_points[seg_idx] + d_seg * dx_k
+                # A ray stands for a tube of angular width ray.dtheta whose
+                # transverse width grows with the distance from the family
+                # origin; when it exceeds one cell (far field, sparse
+                # diffracted fans) the sample is spread over the cells the
+                # tube covers so that the field stays amplitude x density.
+                w_tube = ray.dtheta * (ray.x_src + x_s)
+                n_sub  = max(1, int(np.ceil(w_tube / d_x)))
+                if n_sub == 1:
+                    cells = [pos]
+                else:
+                    offs  = (np.arange(n_sub) - 0.5 * (n_sub - 1)) * (w_tube / n_sub)
+                    cells = [pos + n_perp * o for o in offs]
+                s = None
+                for p_c in cells:
+                    zi, zk = _grid_index(p_c, XMIN, XMAX, ngridx, YMIN, YMAX, ngridy)
+                    if not (0 <= zi < ngridx and 0 <= zk < ngridy):
+                        continue
+                    if s is None:
+                        t_s = t0 + dx_k / v
+                        s   = cur_amp * irfft(cur_f, n=n_t)
+                        if g_samples is not None:
+                            s *= g_samples[k_s]
+                        # causality mask (t/2 accounts for dispersion smearing,
+                        # matching the convention in Ray.signal_at_x)
+                        s[:np.searchsorted(t_vec, t_s / 2)] = 0.0
+                        s_frames = (s[frame_t_indices] / n_sub).astype(np.float32)
+                    z_frames[:, zi, zk] += s_frames
 
                 # Advance recurrence — cheap multiply, no exp
                 cur_f   *= step_phase

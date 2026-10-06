@@ -46,6 +46,13 @@ def main() -> None:
     ap.add_argument('--birth-direction-dispersion', action='store_true',
                     help='keep the birth-direction dispersion curve after reflections '
                          '(v1 behaviour); sets RayTracing.Ray.dispersion_follows_direction=False')
+    ap.add_argument('--no-diffraction', action='store_true',
+                    help='disable the corner diffraction (RayTracing.Ray.diffraction=False); '
+                         'ignored by solver copies that do not have it')
+    ap.add_argument('--v1-physics', action='store_true',
+                    help='v1 wall physics: no corner diffraction and the transmitted share is '
+                         'lost at total internal reflection (RayTracing.Ray.diffraction=False, '
+                         'total_internal_reflection=False); ignored by copies without them')
     args = ap.parse_args()
 
     # Bind the solver package to the requested directory BEFORE anything from
@@ -59,6 +66,10 @@ def main() -> None:
 
     if args.birth_direction_dispersion:
         RayTracing.Ray.dispersion_follows_direction = False
+    if (args.no_diffraction or args.v1_physics) and hasattr(RayTracing.Ray, 'diffraction'):
+        RayTracing.Ray.diffraction = False
+    if args.v1_physics and hasattr(RayTracing.Ray, 'total_internal_reflection'):
+        RayTracing.Ray.total_internal_reflection = False
 
     sys.path.insert(0, _EXAMPLE_DIR)
     import numpy as np  # noqa: E402

@@ -1,6 +1,6 @@
 import numpy as np
 from scipy.fft import rfft, rfftfreq, irfft
-from geom.geom_utils import norm_2d, wrap_angle_pi
+from geom.geom_utils import norm_2d, wrap_angle_pi, _point_seg_dist_2d_numba
 # from utils_rays.ray_utils import save_ray
 from RayTracing.Signal import burst_hann
 import logging
@@ -15,6 +15,34 @@ ray_color = np.array((0.2, 0.6, 0.2, 0.7))  # default ray color
 # (behaviour of the original v1 solver).
 dispersion_follows_direction = True
 
+# Edge (corner) diffraction: the one ray of each family that passes within
+# half a ray spacing of a wall vertex launches fans of diffracted rays that
+# keep the field continuous across the shadow boundaries of the vertex
+# (see utils_rays.ray_utils.ray_diff and utils_rays.utd).  ``diff_params``:
+#   dtheta_factor -- angular spacing of a fan (next to its boundary) relative
+#                    to the incident family
+#   uniform_angle -- [rad] beyond this angle from the boundary the spacing
+#                    grows linearly with the angle, up to max_spacing [rad]
+#   max_angle     -- half-width [rad] of a fan around its shadow boundary
+#   max_order     -- rays of this diffraction order (or higher) do not diffract
+#   min_jump      -- shadow boundaries with a smaller GO jump (relative to the
+#                    incident amplitude) are ignored
+#   min_amp       -- fans whose amplitude at the boundary (half the jump times
+#                    the incident amplitude) is below this are not spawned
+#   min_rel_amp   -- same threshold relative to the source ray amplitude
+#                    (``Beam.a0``): weak families (multiply reflected, ...)
+#                    do not diffract
+diffraction = True
+# Total internal reflection: when a ray cannot refract into the medium behind
+# a wall (Snell gives |sin| > 1) the transmitted share is reflected too, so
+# the wall reflects (1 - bl) of the amplitude instead of ratio_rfl * (1 - bl)
+# and the energy is not silently lost (v1 behaviour, ``False``).
+total_internal_reflection = True
+diff_params = dict(dtheta_factor=2., uniform_angle=np.deg2rad(3.), max_spacing=np.deg2rad(1.5),
+                   max_angle=np.pi / 2., max_order=1, min_jump=0.02, min_amp=10. * a_tol,
+                   min_rel_amp=0.05)
+_ray_diff = None  # lazily imported utils_rays.ray_utils.ray_diff (circular import)
+
 
 def alive_ray(ray, i=-1):
     if ray.medium is not None:
@@ -28,7 +56,8 @@ class Ray:
                  'medium', 'kind', 'a', 'x',
                  'trace_points', 'd', 'int_times', 'freq',
                  'fft_freq', 'fft_speed', 'alive', '_hash',
-                 '_dom_freq_idx', '_dom_freq', '_phase_coeff')
+                 '_dom_freq_idx', '_dom_freq', '_phase_coeff',
+                 'x_src', 'dtheta', 'amp_law', 'diff_order', '_vseen')
 
     def __init__(self, origin, direction, freq, medium, t,
                  kind='S0', t0=0., a=1.,
@@ -48,6 +77,16 @@ class Ray:
         :param norm_c: Normalization value for color plots.
         :param kwargs: Additional keyword arguments.
                 - 'parent': Ray
+                - 'x_src': path length [mm] from the origin of the ray family
+                  (the source or the diffracting vertex) to this ray's birth
+                  point; the local ray spacing is ``dtheta * (x_src + x)``
+                - 'dtheta': angular spacing [rad] of the ray family (0: the
+                  ray never diffracts)
+                - 'amp_law': None, or ``(X, dphi, k, x_off)`` for a diffracted
+                  ray: the amplitude is multiplied at path position ``x`` by
+                  ``amp_factor(x)`` (see there)
+                - 'diff_order': diffraction order (0 for geometrical rays)
+                - '_hash_extra': extra hashable term to make the hash unique
         """
 
         p = kwargs.get('parent', None)
@@ -88,6 +127,13 @@ class Ray:
 
         self.alive = True
 
+        # Diffraction bookkeeping (see the class docstring / ray_diff)
+        self.x_src = float(kwargs.get('x_src', 0.))
+        self.dtheta = float(kwargs.get('dtheta', 0.))
+        self.amp_law = kwargs.get('amp_law', None)
+        self.diff_order = int(kwargs.get('diff_order', 0))
+        self._vseen = None
+
         # Dominant frequency bin — invariant because fshift only rotates phases
         self._dom_freq_idx = np.argmax(np.abs(freq))
         self._dom_freq = self.fft_freq[self._dom_freq_idx]
@@ -97,7 +143,29 @@ class Ray:
         # hashed through their raw bytes; building 500-element tuples was a
         # measurable cost per spawned ray.
         self._hash = hash((self.kind, self.d[0].tobytes(), self.trace_points[0].tobytes(),
-                           float(self.int_times[0]), np.asarray(self.freq[0]).tobytes()))
+                           float(self.int_times[0]), np.asarray(self.freq[0]).tobytes(),
+                           kwargs.get('_hash_extra', None)))
+
+    def amp_factor(self, x):
+        """Amplitude factor of a diffracted ray at path position(s) ``x``.
+
+        ``ray.a`` is law-free (the birth amplitude with damping only); the
+        field of a diffracted fan is ``a * amp_factor(x)`` with
+        ``amp_factor = rho/(X + rho) * T(w)``, ``rho = x_off + x`` the path
+        length from the diffracting vertex, ``X`` the path from the origin of
+        the incident family to the vertex (so that the fan, whose ray density
+        is 1/rho, decays like the incident family, 1/(X + rho)), and ``T`` the
+        UTD Fresnel transition (``utils_rays.utd.transition_T``) at the
+        dominant frequency for the ray's angle ``dphi`` from the shadow
+        boundary.  Returns 1 (scalar) for geometrical rays.
+        """
+        if self.amp_law is None:
+            return 1.
+        from utils_rays.utd import transition_T, fresnel_w
+        X, dphi, k, x_off = self.amp_law
+        rho = np.asarray(x, dtype=float) + x_off
+        # UTD distance parameter of a point source, L = rho X / (rho + X)
+        return rho / (X + rho) * transition_T(fresnel_w(k, rho * X / (X + rho), dphi))
 
     def _dispersion_for_direction(self, d) -> tuple:
         """Phase-velocity array and dispersion coefficient for direction ``d``.
@@ -257,6 +325,30 @@ class Ray:
         for sens in self.medium.sensors:
             sens.intersect(self, t, r_map, p_end)  # sensors don't interact
 
+        # Edge diffraction: capture the vertices the (truncated) trace passes
+        # within half a ray spacing, s = dtheta * (x_src + x).  Windows of
+        # width s tile the wavefront, so exactly one ray per family captures
+        # each vertex.  Rays born next to the vertex (fans, daughters spawned
+        # on its faces) and rays that already diffracted there are excluded.
+        if diffraction and self.dtheta > 0. and self.diff_order < diff_params['max_order'] \
+                and self.medium.vertices:
+            global _ray_diff
+            if _ray_diff is None:
+                from utils_rays.ray_utils import ray_diff as _rd
+                _ray_diff = _rd
+            seg_len = norm_2d(p_end - p0)
+            for v in self.medium.vertices:
+                if self._vseen is not None and id(v) in self._vseen:
+                    continue
+                dist, tf = _point_seg_dist_2d_numba(v.p, p0, p_end)
+                x_foot = self.x[-2] + tf * seg_len
+                half_s = 0.5 * self.dtheta * (self.x_src + x_foot)
+                if dist <= half_s and norm_2d(p0 - v.p) > half_s:
+                    if self._vseen is None:
+                        self._vseen = []
+                    self._vseen.append(id(v))
+                    rfr_rays.extend(_ray_diff(self, v, x_foot, t, r_map))
+
         if best is not None:
             obj, (_, intersect, n, d) = best
             rfr_rays.extend(obj.interact(self, n, d, intersect, t, r_map))
@@ -388,7 +480,7 @@ class Ray:
         """
 
         a_i, f_i, t_i = self.signal_at_x_f(x)
-        s = a_i*irfft(f_i, n=len(self.t))
+        s = a_i*self.amp_factor(x)*irfft(f_i, n=len(self.t))
         # everything before the time in which the ray reaches x must be 0
         # solves weird fft issues
         # tz = np.ones(self.t.shape)
@@ -405,7 +497,7 @@ class Ray:
         """
 
         a_i, f_i, t_i = self.a[i], self.freq[i], self.int_times[i]
-        s = a_i*irfft(f_i, n=len(self.t))
+        s = a_i*self.amp_factor(self.x[i])*irfft(f_i, n=len(self.t))
         # everything before the time in which the ray reaches x must be 0
         # solves weird fft issues
         # tz = np.ones(self.t.shape)
@@ -535,6 +627,8 @@ class Beam:
             # colors = plt.cm.jet(np.linspace(0, 1, self.n_rays))
 
             theta_d = np.arctan(d[1] / d[0])
+            # angular spacing of the fan: sets the vertex capture width
+            self.dtheta = (theta_f - theta_i) / self.n_rays
             for i in range(self.n_rays):
 
                 theta = (theta_f - theta_i) / self.n_rays * i + theta_d
@@ -543,16 +637,16 @@ class Beam:
                 if kind not in ['S0', 'A0']:
                     ray_a = Ray(origin=self.o, direction=d, freq=self.freq, t=self.t,
                                 medium=medium, kind='A0', a=self.a0, nfft=self.nfft,
-                                _fft_freq=self.fft_freq)
+                                _fft_freq=self.fft_freq, dtheta=self.dtheta)
                     ray_s = Ray(origin=self.o, direction=d, freq=self.freq, t=self.t,
                                 medium=medium, kind='S0', a=self.a0, nfft=self.nfft,
-                                _fft_freq=self.fft_freq)
+                                _fft_freq=self.fft_freq, dtheta=self.dtheta)
                     self.rays.append(ray_a)
                     self.rays.append(ray_s)
                 else:
                     ray_i = Ray(origin=self.o, direction=d, freq=self.freq, t=self.t,
                                 medium=medium, kind=kind, a=self.a0, nfft=self.nfft,
-                                _fft_freq=self.fft_freq)
+                                _fft_freq=self.fft_freq, dtheta=self.dtheta)
                     self.rays.append(ray_i)
 
     def inp_signal(self):

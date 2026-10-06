@@ -36,7 +36,8 @@ def run(mesh: str, out: str, args: argparse.Namespace, log: str) -> dict:
            '--code-dir', _REPO_ROOT, '--out', out, '--case', 'dmg',
            '--nrays', str(args.nrays), '--nt', str(args.nt), '--tmax', str(args.tmax),
            '--nfft', str(args.nfft), '--source', str(args.source), '--log', log,
-           '--mesh', mesh, '--shape', args.shape, '--phidmg', str(args.phidmg)]
+           '--mesh', mesh, '--shape', args.shape, '--phidmg', str(args.phidmg),
+           '--no-diffraction']  # mesh-equivalence check: the cell mesh has no diffracting vertices
     if args.birth_direction_dispersion:
         cmd.append('--birth-direction-dispersion')
     res = subprocess.run(cmd, cwd=_REPO_ROOT, capture_output=True, text=True)

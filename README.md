@@ -115,6 +115,83 @@ m.plot2d()
     default `True`; set it to `False` to recover the v1 behaviour, which kept
     the birth-direction curve for the whole life of a ray).
 
+## Edge diffraction
+
+Geometrical optics casts a sharp shadow behind every corner: two rays a
+hair apart at a vertex of the damage take completely different paths, and the
+sensor amplitude jumped by 2.5x within 2 degrees across the corner shadow
+line of the MUSE square (a physical shadow needs a Fresnel number
+`a^2 / (lambda * distance) >> 1`; for the 48 mm square and the 14.9 mm S0
+wavelength it is 0.4 at 100 mm behind the damage). The solver therefore
+adds edge diffraction in the spirit of the Uniform Theory of Diffraction
+(Keller; Kouyoumjian & Pathak): every convex corner of a wall is a secondary
+source.
+
+- `geom.objects_2d.build_vertices` (called by `Map2D`) finds the `Vertex`
+  objects: endpoints shared by two `Segment` walls, or free edges (the tip of
+  a screen). The outline of a medium (the plate) does not diffract; corners
+  shared by 3+ walls (the legacy cell mesh) are skipped with a warning.
+- In `Ray.trace`, the one ray of each ray family that passes within half a
+  ray spacing of a vertex (`dtheta * (x_src + x)`, so exactly one ray per
+  family) calls `utils_rays.ray_utils.ray_diff`. Two probe rays straddling the
+  vertex are traced through the walls of the obstacle, carrying the ray's
+  spectrum dispersed along every leg; every outgoing family (incident,
+  reflected, transmitted, entered-next-to-the-corner-and-left-through-the-
+  adjacent-face, ...) whose spectrum differs between the probes is a shadow
+  boundary whose jump is the complex difference spectrum (so a transmitted
+  wave that is delayed and chirped by the thicker region is compensated
+  with its actual waveform, not just an amplitude ratio). A transparent
+  wall gives no fan.
+- For each boundary a fan of rays is launched from the vertex: spectrum
+  half the jump, negative where the family exists and positive in its
+  shadow, amplitude that of the incident ray (times the fan/incident spacing
+  ratio), and a per-ray amplitude law `Ray.amp_factor(x) =
+  rho/(X+rho) * T(w)` with `T` the Fresnel transition function
+  (`utils_rays.utd`) evaluated at the dominant frequency and `X` the path
+  from the family origin to the vertex, so that the fan (ray density
+  `1/rho`) decays like the incident family and GO + fan is continuous.
+  Fans are dense (2x the incident spacing) within 3 degrees of the boundary
+  and sparser further out, up to 90 degrees; the amplitude of a ray is
+  proportional to its angular coverage.
+- Module switch `RayTracing.Ray.diffraction` (default `True`) and parameters
+  `RayTracing.Ray.diff_params`. Sensors apply the amplitude law in
+  `Sensor._integrate_run`; the video renderer (`example/plot_wave_video.py`)
+  spreads every ray over its tube width so that sparse fan rays do not show
+  as streaks.
+- Validation (`tests/test_diffraction.py`): a rigid screen with a free edge
+  in an absorbing plate reproduces the exact Sommerfeld half-plane solution
+  (350 kHz component, screen / no screen): 0.59 on the shadow boundary
+  (exact 0.46-0.53), 0.42 / 0.30 / 0.20 at 5 / 15 / 25 degrees into the
+  shadow (exact 0.37 / 0.19 / 0.19), 0.73 on the reflection boundary
+  (exact 0.68). On the MUSE 48 mm square the ratio to the intact plate across
+  the top-left corner line at 270 mm from the source goes 0.28, 0.42, 0.46,
+  0.47 | 0.50, 0.56, 0.59, 0.66, 0.77 at -6, -4, -2, -1 | +1, +2, +4, +6
+  degrees (pure GO: 0.35, 0.34, 0.08, 0.00 | 1.00, 1.00, 1.00, 1.00).
+- Independent reference (`tests/compare_fdtd_corner.py`): a 2D
+  finite-difference solution of the scalar wave equation for the same
+  idealised problem (isotropic, non-dispersive plate 5.205 mm/us with the
+  48 mm square at 4.432 mm/us, absorbing edges, point source). Across the
+  corner shadow line the ray model with diffraction deviates from the
+  reference by 0.13 RMS (0.37 without); on receiver lines behind the damage
+  by 0.38 (0.48 without), the remainder being the sharper ray caustics of
+  the focusing inside the slower square.
+- That comparison also exposed a lost-energy bug at **total internal
+  reflection**: when Snell's law has no solution the solver dropped the
+  transmitted share, so the slower square could not act as the light pipe
+  the reference shows (2x on-axis amplitude). The wall now reflects
+  `(1 - bl)` in that case (`RayTracing.Ray.total_internal_reflection`,
+  default `True`; the v1 harness runs with `--v1-physics`, which turns both
+  it and the diffraction off). The probe tracing of `ray_diff` applies the
+  same rule.
+- Not modelled: the tangent shadow boundary of the ellipse (creeping
+  waves), mode conversion at the edge, the frequency dependence of the
+  transition (dominant frequency only), diffraction of diffracted rays
+  (`max_order=1`). Cost on the full benchmark (12 mm square, one source):
+  17.3k rays and 3.4 s against 4.8k rays and 1.0 s with the v1 physics (no diffraction, no total internal reflection). The
+  regression harnesses `tests/compare_v1_v2.py` and
+  `tests/compare_cells_holes.py` run with `--no-diffraction` (v1 and the cell
+  mesh have no diffracting vertices).
+
 ## Performance
 
 Benchmark: one source, 2001 rays, 726 × 726 mm CFRP plate with a 12 × 12 mm
@@ -167,6 +244,8 @@ the step; see `Optimization/New/Performance_Evolution_stage3.csv`):
 python tests/test_signal_on_ray.py
 python tests/test_ellipse.py
 python tests/test_hole_mesh.py
+python tests/test_diffraction.py
+python tests/compare_fdtd_corner.py
 python tests/compare_v1_v2.py --v1-dir <v1 snapshot dir> --nrays 201
 python tests/compare_cells_holes.py [--full] [--shape ellipse] [--plot]
 ```

@@ -26,6 +26,9 @@ class Map2D:
         self.mediums = {m.__hash__(): m for m in mediums}
         self.sensors = []
 
+        # Diffracting corners of the walls (see objects_2d.build_vertices)
+        self.vertices = objects_2d.build_vertices(list(mediums))
+
         for m in mediums:
             for o in m.objs:
                 if hasattr(o, 'map'):

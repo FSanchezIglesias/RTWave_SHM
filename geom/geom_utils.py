@@ -263,3 +263,29 @@ def wrap_angle_pi(theta):
     if theta >= np.pi - _ANGLE_TOL:
         return 0.
     return theta
+
+
+@jit(nopython=True, cache=True)
+def _point_seg_dist_2d_numba(p, a, b):
+    """Distance from point ``p`` to the segment ``a -> b``.
+
+    Returns ``(dist, t)`` with ``t`` in [0, 1] the parameter of the foot of the
+    perpendicular clamped to the segment (``a + t*(b - a)``).
+    """
+    rx = b[0] - a[0]
+    ry = b[1] - a[1]
+    l2 = rx * rx + ry * ry
+    if l2 <= 0.0:
+        dx = p[0] - a[0]
+        dy = p[1] - a[1]
+        return (dx * dx + dy * dy) ** 0.5, 0.0
+    t = ((p[0] - a[0]) * rx + (p[1] - a[1]) * ry) / l2
+    if t < 0.0:
+        t = 0.0
+    elif t > 1.0:
+        t = 1.0
+    fx = a[0] + t * rx
+    fy = a[1] + t * ry
+    dx = p[0] - fx
+    dy = p[1] - fy
+    return (dx * dx + dy * dy) ** 0.5, t

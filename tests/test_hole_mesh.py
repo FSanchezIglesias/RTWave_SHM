@@ -137,6 +137,12 @@ class TestMuseHoleMesh(unittest.TestCase):
             self.assertGreaterEqual(n_checked, 5)
 
     def test_holes_match_cells_physical_damage(self):
+        # mesh-equivalence check: the cell mesh has no diffracting vertices
+        # (its corners are shared by 3+ walls), so compare without diffraction
+        import RayTracing.Ray as _ray_mod
+        _diff = _ray_mod.diffraction
+        _ray_mod.diffraction = False
+        self.addCleanup(setattr, _ray_mod, 'diffraction', _diff)
         for shape in ('rect', 'ellipse'):
             m_c, s_c = self._run(shape=shape, phidmg=0.4, mesh='cells')
             m_h, s_h = self._run(shape=shape, phidmg=0.4, mesh='holes')

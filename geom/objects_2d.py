@@ -1,9 +1,10 @@
 import numpy as np
 
 # import math
-from geom.geom_utils import (seg_seg_intersect_2d, norm_2d, cross_2d, _seg_seg_intersect_2d_numba,
-                             _ellipse_seg_intersect_2d_numba, wrap_angle_pi)
+from geom.geom_utils import (seg_seg_intersect_2d, norm_2d, cross_2d, dot_2d, _seg_seg_intersect_2d_numba,
+                             _ellipse_seg_intersect_2d_numba, _point_seg_dist_2d_numba, wrap_angle_pi)
 from utils_rays.ray_utils import ray_refl, ray_refr
+import RayTracing.Ray as _ray_module
 
 _SEG_TOL = 1.e-9  # distance tolerance [mm] of the segment-segment intersection test
 
@@ -51,6 +52,9 @@ class medium:
         # List of objects contained in the medium
         self.objs = []
         self.sensors = []
+        # Diffracting vertices (corners) of the medium's walls, filled by
+        # ``build_vertices`` (called from ``Map2D.__init__``)
+        self.vertices = []
 
         # random value based on medium thickness and xi,
         # because I don't want to implement hashing on the wave speed function
@@ -86,6 +90,27 @@ class medium:
         theta = wrap_angle_pi(theta)
 
         return self._ws_func[ray.kind]((f_d, theta)) * 1.E3
+
+    def v_dir(self, kind, fi, d):
+        """Phase velocity [mm/s] of mode ``kind`` at frequency ``fi`` [Hz]
+        for the unit direction ``d`` (``v_ray`` without a ``Ray``)."""
+        theta = wrap_angle_pi(np.arctan2(d[1], d[0]) + self.theta)
+        return self._ws_func[kind]((fi * self._th_factor, theta)) * 1.E3
+
+    def phase_coeff(self, kind, fft_freq, d):
+        """Dispersion coefficient ``-2j pi f / v(f)`` of mode ``kind`` for the
+        unit direction ``d`` (``Ray._dispersion_for_direction`` without a
+        ``Ray``): ``exp(phase_coeff * x) * F`` propagates a spectrum ``F``
+        over ``x`` mm in this medium."""
+        theta = wrap_angle_pi(np.arctan2(d[1], d[0]) + self.theta)
+        if hasattr(self.ws, 'batch_speed'):
+            x_vals = np.ascontiguousarray(fft_freq * self._th_factor)
+            v = self.ws.batch_speed(kind, x_vals, theta) * 1.E3
+        else:
+            v = np.array([self._ws_func[kind]((fi * self._th_factor, theta)) * 1.E3
+                          for fi in fft_freq])
+        return np.nan_to_num((-0. - 1j) * 2 * np.pi * fft_freq / v,
+                             nan=0.0, posinf=0.0, neginf=0.0)
     
     # def tl(self, ray):
     #     # the ray has already advanced
@@ -158,21 +183,30 @@ def _interact(obj, ray, n, d, intersect, t, map):
     t_int = norm_2d(intersect-ray.trace_points[-2]) / norm_2d(ray.trace_points[-1]-ray.trace_points[-2]) \
             * (t-ray.int_times[-2]) + ray.int_times[-2]
 
+    # Snell's law for every medium behind the wall, with the incident
+    # direction (before the reflection below mutates it).  Total internal
+    # reflection: no medium can take the transmitted share -> it is reflected.
+    others = [m2 for m2 in obj.mediums if m2 is not ray.medium]
+    v_in = ray.medium.v_ray(ray) if others else None
+    sin_i = dot_2d(ray.d[-1], d) if others else 0.
+    v2_v1 = {id(m2): m2.v_ray(ray) / v_in for m2 in others}
+    tir = bool(others) and all(abs(v2_v1[id(m2)] * sin_i) > 1. for m2 in others)
+    ratio_rfl = 1. if (tir and _ray_module.total_internal_reflection) else obj.ratio_rfl
+
     # Reflect ray
     irays_rfl, ray_params_i = ray_refl(ray, n, d, intersect, t_int, t,
-                                       ratio=obj.ratio_rfl, ratio_mode=obj.ratio_mode,
+                                       ratio=ratio_rfl, ratio_mode=obj.ratio_mode,
                                        bl=obj.bl, map=map)
     irays.extend(irays_rfl)
 
     # Refract ray on all remaining boundaries
-    if len(obj.mediums) > 1:
+    if others and not tir:
         x_i, trace_i, d_i, f_i, a_i, t_i = ray_params_i
-        ratio_rfr = (1 - obj.ratio_rfl) / (len(obj.mediums) - 1)
-        for m2 in obj.mediums:
-            if not m2 == ray.medium:
-                irays.extend(ray_refr(ray, n, d, intersect, t_int, t, d_i, a_i, f_i,
-                                      ratio=ratio_rfr, m2=m2, ratio_mode=obj.ratio_mode,
-                                      bl=obj.bl, map=map))
+        ratio_rfr = (1 - obj.ratio_rfl) / len(others)
+        for m2 in others:
+            irays.extend(ray_refr(ray, n, d, intersect, t_int, t, d_i, a_i, f_i,
+                                  ratio=ratio_rfr, m2=m2, ratio_mode=obj.ratio_mode,
+                                  bl=obj.bl, map=map, v2_v1=v2_v1[id(m2)]))
 
     return irays
 
@@ -490,3 +524,177 @@ class Circle:
     def plot(self, ax):
         for seg in self.segs:
             seg.plot(ax, color=self.color)
+
+_VERTEX_TOL = 1.e-6  # [mm] endpoints closer than this are the same vertex
+
+
+class Vertex:
+    """A corner where the endpoints of one or two ``Segment`` walls meet.
+
+    Vertices are secondary sources of diffracted rays (see
+    ``utils_rays.ray_utils.ray_diff``).  A vertex with a single face is a free
+    edge (e.g. the tip of a screen inside a medium); one with two faces is a
+    wedge.  The angular sector that a given medium occupies at the vertex is
+    resolved when a ray is captured (``sector``), because the walls do not
+    know on which side each medium lies.
+
+    :param p: position [mm]
+    :param faces: list of 1 or 2 ``Segment`` ending at ``p``
+    """
+
+    def __init__(self, p, faces, walls=None):
+        self.p = np.ascontiguousarray(p, dtype=np.float64)
+        self.faces = list(faces)
+        # walls of the obstacle the vertex belongs to (the faces plus every
+        # segment connected to them through shared endpoints); the local
+        # probe tracing of ``ray_diff`` interacts with these only
+        self.walls = list(faces) if walls is None else list(walls)
+        # unit tangents from the vertex towards the other endpoint of each face
+        self.tangents = []
+        for f in self.faces:
+            other = f.a2 if norm_2d(f.a1 - self.p) < norm_2d(f.a2 - self.p) else f.a1
+            t = np.asarray(other, dtype=np.float64) - self.p
+            self.tangents.append(t / norm_2d(t))
+        self.mediums = []
+        for f in self.faces:
+            for m in f.mediums:
+                if m not in self.mediums:
+                    self.mediums.append(m)
+
+    @property
+    def single_medium(self):
+        """True if every face belongs to exactly one, common, medium."""
+        return all(len(f.mediums) == 1 for f in self.faces) and len(self.mediums) == 1
+
+    def sector(self, r):
+        """Angular sector of the vertex that contains the direction ``r``.
+
+        :param r: direction from the vertex towards a point known to lie in
+            the medium of interest
+        :return: ``(faces, tangents, n_out, a_start, extent)``: the faces
+            ordered (start, end) counter-clockwise, their tangents, the
+            unit normals of each face pointing OUT of the sector, the start
+            angle [rad] and the counter-clockwise extent [rad] of the sector.
+        """
+        if len(self.faces) == 1:
+            t = self.tangents[0]
+            f = self.faces[0]
+            if cross_2d(t, r) > 0:      # r counter-clockwise of the face
+                n_out = np.array([t[1], -t[0]])     # clockwise normal
+            else:
+                n_out = np.array([-t[1], t[0]])
+            a0 = np.arctan2(t[1], t[0])
+            return [f, f], [t, t], [n_out, n_out], a0, 2. * np.pi
+
+        tA, tB = self.tangents
+        aA = np.arctan2(tA[1], tA[0])
+        aB = np.arctan2(tB[1], tB[0])
+        ar = np.arctan2(r[1], r[0])
+        ext_AB = (aB - aA) % (2. * np.pi)
+        if (ar - aA) % (2. * np.pi) < ext_AB:
+            fs, fe, ts, te, a0, ext = self.faces[0], self.faces[1], tA, tB, aA, ext_AB
+        else:
+            fs, fe, ts, te, a0, ext = self.faces[1], self.faces[0], tB, tA, aB, 2. * np.pi - ext_AB
+        # the sector lies counter-clockwise of the start face and clockwise of
+        # the end face; normals pointing out of the sector:
+        n_s = np.array([ts[1], -ts[0]])
+        n_e = np.array([-te[1], te[0]])
+        return [fs, fe], [ts, te], [n_s, n_e], a0, ext
+
+    def __repr__(self):
+        return 'Vertex({:.3f}, {:.3f}; {} face(s))'.format(self.p[0], self.p[1], len(self.faces))
+
+
+def build_vertices(mediums, tol=_VERTEX_TOL):
+    """Find the diffracting vertices of the ``Segment`` walls of ``mediums``
+    and store them in ``medium.vertices`` (a vertex is listed in every medium
+    that contains one of its faces).
+
+    Endpoints shared by two segments form a wedge vertex; an endpoint that
+    belongs to a single segment and does not lie on another segment is a free
+    edge.  Endpoints shared by more than two segments (e.g. the legacy cell
+    mesh with invisible walls) are skipped with a warning: diffraction is only
+    supported on the hole mesh.  ``Ellipse`` boundaries have no vertices.
+    """
+    import logging
+    segs = []
+    for m in mediums:
+        for o in m.objs:
+            if isinstance(o, Segment) and o not in segs:
+                segs.append(o)
+    pts = []       # list of [point, [segments]]
+    for sg in segs:
+        for e in (sg._a1, sg._a2):
+            for entry in pts:
+                if norm_2d(entry[0] - e) < tol:
+                    if sg not in entry[1]:
+                        entry[1].append(sg)
+                    break
+            else:
+                pts.append([e.copy(), [sg]])
+
+    # connected components of the walls (shared endpoints) = obstacles
+    adj = {id(sg): set() for sg in segs}
+    for _, fs in pts:
+        for f in fs:
+            for g in fs:
+                if f is not g:
+                    adj[id(f)].add(id(g))
+    by_id = {id(sg): sg for sg in segs}
+    comp_of = {}
+    for sg in segs:
+        if id(sg) in comp_of:
+            continue
+        group = []
+        comp_of[id(sg)] = group
+        stack = [id(sg)]
+        while stack:
+            cur = stack.pop()
+            group.append(by_id[cur])
+            for nb in adj[cur]:
+                if nb not in comp_of:
+                    comp_of[nb] = group
+                    stack.append(nb)
+
+    # closed components whose walls all belong to one medium and span that
+    # medium's bounding box are the medium's outer boundary (e.g. the plate
+    # outline): their corners are interior right angles and do not diffract
+    outer = set()
+    for group in set(id(g) for g in comp_of.values()):
+        walls = next(g for g in comp_of.values() if id(g) == group)
+        meds = set(id(m) for w in walls for m in w.mediums)
+        if len(meds) != 1 or any(len(w.mediums) != 1 for w in walls):
+            continue
+        med = walls[0].mediums[0]
+        xs = [w._a1[0] for w in walls] + [w._a2[0] for w in walls]
+        ys = [w._a1[1] for w in walls] + [w._a2[1] for w in walls]
+        xmax, xmin, ymax, ymin = med.get_limits()
+        if (abs(max(xs) - xmax) < tol and abs(min(xs) - xmin) < tol and
+                abs(max(ys) - ymax) < tol and abs(min(ys) - ymin) < tol):
+            outer.add(group)
+
+    vertices = []
+    for p, faces in pts:
+        if id(comp_of[id(faces[0])]) in outer:
+            continue
+        if len(faces) > 2:
+            logging.warning('Vertex at ({:.3f}, {:.3f}) shared by {} walls: '
+                            'diffraction not supported there'.format(p[0], p[1], len(faces)))
+            continue
+        if len(faces) == 1:
+            # free edge unless the point lies on another wall
+            on_wall = False
+            for sg in segs:
+                if sg is faces[0]:
+                    continue
+                d, _ = _point_seg_dist_2d_numba(p, sg._a1, sg._a2)
+                if d < tol:
+                    on_wall = True
+                    break
+            if on_wall:
+                continue
+        vertices.append(Vertex(p, faces, walls=comp_of[id(faces[0])]))
+
+    for m in mediums:
+        m.vertices = [v for v in vertices if m in v.mediums]
+    return vertices
